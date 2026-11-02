@@ -2,6 +2,7 @@
 
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { theme, CATEGORICAL } from "../dashboard/theme";
+import PaginationControls from "@/components/PaginationControls";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
@@ -80,16 +81,26 @@ export default function RecordsTable({
 
   return (
     <div className="flex flex-col gap-2">
-      <input
-        value={customerSearch}
-        onChange={(e) => {
-          setCustomerSearch(e.target.value);
-          setPage(1);
-        }}
-        placeholder={searchPlaceholder}
-        className={`max-w-xs ${inputClass}`}
-        style={inputStyle}
-      />
+      <div className="flex items-center justify-between gap-4">
+        <input
+          value={customerSearch}
+          onChange={(e) => {
+            setCustomerSearch(e.target.value);
+            setPage(1);
+          }}
+          placeholder={searchPlaceholder}
+          className={`max-w-xs ${inputClass}`}
+          style={inputStyle}
+        />
+        <PaginationControls
+          rangeStart={rangeStart}
+          rangeEnd={rangeEnd}
+          total={filtered.length}
+          page={currentPage}
+          totalPages={totalPages}
+          onPageChange={setPage}
+        />
+      </div>
 
       <div className="overflow-x-auto rounded border" style={{ borderColor: theme.border }}>
         <table className="w-full text-left text-sm">
@@ -154,35 +165,6 @@ export default function RecordsTable({
           </tbody>
         </table>
       </div>
-
-      {filtered.length > 0 && (
-        <div className="flex items-center justify-between text-xs" style={{ color: theme.textMuted }}>
-          <span>
-            Showing {rangeStart}-{rangeEnd} of {filtered.length}
-          </span>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setPage(Math.max(1, currentPage - 1))}
-              disabled={currentPage === 1}
-              className="rounded border px-2 py-1 disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ borderColor: theme.border, color: theme.textSecondary }}
-            >
-              Prev
-            </button>
-            <span>
-              Page {currentPage} of {totalPages}
-            </span>
-            <button
-              onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
-              disabled={currentPage === totalPages}
-              className="rounded border px-2 py-1 disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ borderColor: theme.border, color: theme.textSecondary }}
-            >
-              Next
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

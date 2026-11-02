@@ -3,6 +3,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { theme, CATEGORICAL } from "../dashboard/theme";
+import PaginationControls from "@/components/PaginationControls";
 
 const inputClass = "rounded border px-2 py-1.5 text-sm w-full";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
@@ -160,13 +161,23 @@ export default function ProductsScreen() {
             Search
           </button>
         </form>
-        <button
-          onClick={openCreate}
-          className="rounded px-4 py-1.5 text-sm font-medium"
-          style={{ backgroundColor: theme.accent, color: "#05230f" }}
-        >
-          + Add product
-        </button>
+        <div className="flex items-center gap-4">
+          <PaginationControls
+            rangeStart={rangeStart}
+            rangeEnd={rangeEnd}
+            total={products.length}
+            page={currentPage}
+            totalPages={totalPages}
+            onPageChange={setPage}
+          />
+          <button
+            onClick={openCreate}
+            className="rounded px-4 py-1.5 text-sm font-medium"
+            style={{ backgroundColor: theme.accent, color: "#05230f" }}
+          >
+            + Add product
+          </button>
+        </div>
       </div>
 
       {error && <p className="text-sm text-red-400">{error}</p>}
@@ -239,35 +250,6 @@ export default function ProductsScreen() {
           </tbody>
         </table>
       </div>
-
-      {products.length > 0 && (
-        <div className="flex items-center justify-between text-xs" style={{ color: theme.textMuted }}>
-          <span>
-            Showing {rangeStart}-{rangeEnd} of {products.length}
-          </span>
-          <div className="flex items-center gap-3">
-            <button
-              onClick={() => setPage(Math.max(1, currentPage - 1))}
-              disabled={currentPage === 1}
-              className="rounded border px-2 py-1 disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ borderColor: theme.border, color: theme.textSecondary }}
-            >
-              Prev
-            </button>
-            <span>
-              Page {currentPage} of {totalPages}
-            </span>
-            <button
-              onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
-              disabled={currentPage === totalPages}
-              className="rounded border px-2 py-1 disabled:cursor-not-allowed disabled:opacity-40"
-              style={{ borderColor: theme.border, color: theme.textSecondary }}
-            >
-              Next
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   );
 }

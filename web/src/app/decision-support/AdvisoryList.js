@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { theme } from "../dashboard/theme";
 import AdvisoryCard from "./AdvisoryCard";
+import PaginationControls from "@/components/PaginationControls";
 
 const PAGE_SIZE = 20;
 
@@ -36,17 +37,27 @@ export default function AdvisoryList({ advisories, byType, severityColor }) {
 
   return (
     <>
-      <div className="mb-6 flex gap-3">
-        {CHIPS.map((c) => (
-          <SummaryChip
-            key={c.type}
-            label={c.label}
-            count={byType[c.type] ?? 0}
-            color={severityColor[c.severity]}
-            active={typeFilter === c.type}
-            onClick={() => toggleFilter(c.type)}
-          />
-        ))}
+      <div className="mb-6 flex items-center justify-between gap-4">
+        <div className="flex gap-3">
+          {CHIPS.map((c) => (
+            <SummaryChip
+              key={c.type}
+              label={c.label}
+              count={byType[c.type] ?? 0}
+              color={severityColor[c.severity]}
+              active={typeFilter === c.type}
+              onClick={() => toggleFilter(c.type)}
+            />
+          ))}
+        </div>
+        <PaginationControls
+          rangeStart={rangeStart}
+          rangeEnd={rangeEnd}
+          total={filtered.length}
+          page={currentPage}
+          totalPages={totalPages}
+          onPageChange={setPage}
+        />
       </div>
 
       {filtered.length === 0 ? (
@@ -54,47 +65,16 @@ export default function AdvisoryList({ advisories, byType, severityColor }) {
           {typeFilter ? "No advisories match this filter." : "No advisories right now - nothing needs attention."}
         </p>
       ) : (
-        <>
-          <div className="flex flex-col gap-3">
-            {paginated.map((a) => (
-              <AdvisoryCard
-                key={`${a.sku}-${a.type}`}
-                advisory={a}
-                typeLabel={TYPE_LABEL[a.type]}
-                severityColor={severityColor[a.severity]}
-              />
-            ))}
-          </div>
-
-          {filtered.length > PAGE_SIZE && (
-            <div className="mt-3 flex items-center justify-between text-xs" style={{ color: theme.textMuted }}>
-              <span>
-                Showing {rangeStart}-{rangeEnd} of {filtered.length}
-              </span>
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={() => setPage(Math.max(1, currentPage - 1))}
-                  disabled={currentPage === 1}
-                  className="rounded border px-2 py-1 disabled:cursor-not-allowed disabled:opacity-40"
-                  style={{ borderColor: theme.border, color: theme.textSecondary }}
-                >
-                  Prev
-                </button>
-                <span>
-                  Page {currentPage} of {totalPages}
-                </span>
-                <button
-                  onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
-                  disabled={currentPage === totalPages}
-                  className="rounded border px-2 py-1 disabled:cursor-not-allowed disabled:opacity-40"
-                  style={{ borderColor: theme.border, color: theme.textSecondary }}
-                >
-                  Next
-                </button>
-              </div>
-            </div>
-          )}
-        </>
+        <div className="flex flex-col gap-3">
+          {paginated.map((a) => (
+            <AdvisoryCard
+              key={`${a.sku}-${a.type}`}
+              advisory={a}
+              typeLabel={TYPE_LABEL[a.type]}
+              severityColor={severityColor[a.severity]}
+            />
+          ))}
+        </div>
       )}
     </>
   );
