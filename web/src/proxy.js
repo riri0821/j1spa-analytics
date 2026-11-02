@@ -37,7 +37,7 @@ export async function proxy(request) {
     "/login",
     "/auth/confirm",
     "/api/auth/forgot-password",
-    "/api/auth/login-guard",
+    "/api/auth/login",
   ].some((p) => request.nextUrl.pathname.startsWith(p));
 
   if (!user && !isPublicPath) {

@@ -4,11 +4,9 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { motion, AnimatePresence } from "framer-motion";
 import { User, Lock, Eye, EyeOff, AlertCircle, CheckCircle2, Loader2 } from "lucide-react";
-import { createClient } from "@/lib/supabase/client";
 
 export default function LoginPage() {
   const router = useRouter();
-  const supabase = createClient();
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -66,62 +64,32 @@ export default function LoginPage() {
     setForgotSent(false);
   }
 
-  async function loginGuard(action) {
-    const res = await fetch("/api/auth/login-guard", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, action }),
-    });
-    return res.json();
-  }
-
   async function handleSubmit(e) {
     e.preventDefault();
     setErrorMessage("");
     setIsSubmitting(true);
 
-    const guard = await loginGuard("check");
-    if (guard.locked) {
-      setErrorMessage(guard.message);
+    let body;
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      body = await res.json();
+      if (!res.ok) {
+        setErrorMessage(body.error || "Something went wrong. Try again.");
+        setIsSubmitting(false);
+        return;
+      }
+    } catch {
+      setErrorMessage("Something went wrong. Try again.");
       setIsSubmitting(false);
       return;
     }
 
-    const { data, error: signInError } = await supabase.auth.signInWithPassword({ email, password });
-
-    if (signInError) {
-      const failResult = await loginGuard("fail");
-      setErrorMessage(
-        failResult.locked
-          ? failResult.message
-          : `${signInError.message} (${failResult.attemptsRemaining} attempt${failResult.attemptsRemaining === 1 ? "" : "s"} remaining before lockout.)`
-      );
-      setIsSubmitting(false);
-      return;
-    }
-
-    await loginGuard("success");
-
-    const { data: profile, error: profileError } = await supabase
-      .from("profiles")
-      .select("role, is_active")
-      .eq("id", data.user.id)
-      .single();
-
-    if (profileError) {
-      setErrorMessage("Signed in, but no profile row was found for this account.");
-      setIsSubmitting(false);
-      return;
-    }
-
-    if (!profile.is_active) {
-      await supabase.auth.signOut();
-      setErrorMessage("This account has been deactivated. Contact the owner.");
-      setIsSubmitting(false);
-      return;
-    }
-
-    router.push(profile.role === "owner" ? "/dashboard" : "/sales");
+    setPassword("");
+    router.push(body.redirectTo);
     router.refresh();
   }
 
@@ -189,8 +157,6 @@ export default function LoginPage() {
                     setEmail(e.target.value);
                     if (errorMessage) setErrorMessage("");
                   }}
-                  onFocus={() => setFocusedField("email")}
-                  onBlur={() => setFocusedField(null)}
                   placeholder="owner@example.com"
                   className="w-full rounded-xl border border-[rgba(255,255,255,0.08)] bg-[#0d1119] py-3 pl-10 pr-4 text-sm text-[#f5f6f8] transition-colors placeholder:text-[#6b7280] focus:border-[#22c55e] focus:outline-none focus:ring-1 focus:ring-[#22c55e]/50"
                 />
@@ -239,7 +205,8 @@ export default function LoginPage() {
                   setEmail(e.target.value);
                   if (errorMessage) setErrorMessage("");
                 }}
-                placeholder="username"
+                placeholder="you@example.com"
+                autoComplete="email"
                 className="w-full rounded-xl border border-[rgba(255,255,255,0.08)] bg-[#0d1119] py-3 pl-10 pr-4 text-sm text-[#f5f6f8] transition-colors placeholder:text-[#6b7280] focus:border-[#22c55e] focus:outline-none focus:ring-1 focus:ring-[#22c55e]/50"
               />
             </div>
@@ -258,6 +225,7 @@ export default function LoginPage() {
                   if (errorMessage) setErrorMessage("");
                 }}
                 placeholder="••••••••"
+                autoComplete="current-password"
                 className="w-full rounded-xl border border-[rgba(255,255,255,0.08)] bg-[#0d1119] py-3 pl-10 pr-10 text-sm text-[#f5f6f8] transition-colors placeholder:text-[#6b7280] focus:border-[#22c55e] focus:outline-none focus:ring-1 focus:ring-[#22c55e]/50"
               />
               <button

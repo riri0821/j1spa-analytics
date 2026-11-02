@@ -1,16 +1,22 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireOwner } from "@/lib/requireOwner";
 
 export async function POST(request) {
+  // Owner-only: this deletes or deactivates catalog rows, which the
+  // Products screen (itself owner-gated) is the only UI for.
+  const auth = await requireOwner();
+  if (auth.error) return auth.error;
+
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Not signed in." }, { status: 401 });
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
   }
 
-  const body = await request.json();
   const productId = Number(body.product_id);
   if (!productId) {
     return NextResponse.json({ error: "product_id is required." }, { status: 400 });

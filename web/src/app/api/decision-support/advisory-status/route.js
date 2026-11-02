@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireOwner } from "@/lib/requireOwner";
 
 const VALID_TYPES = ["low_stock", "demand_spike", "overstock"];
 
@@ -9,15 +10,22 @@ const VALID_TYPES = ["low_stock", "demand_spike", "overstock"];
 // lib/decisionSupport.js, which still runs and is still shown, just
 // outranked. See sql/supabase_add_advisory_overrides.sql.
 export async function POST(request) {
+  // Decision Support is an owner-only screen, so this has to check the role
+  // and not just that someone is signed in - a staff session could
+  // otherwise POST here directly and rewrite the owner's overrides.
+  const auth = await requireOwner();
+  if (auth.error) return auth.error;
+  const { user } = auth;
+
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Not signed in." }, { status: 401 });
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
   }
 
-  const body = await request.json();
   const productId = Number(body.product_id);
   const manualType = (body.manual_type ?? "").trim();
 

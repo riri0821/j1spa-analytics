@@ -1,16 +1,24 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { requireOwner } from "@/lib/requireOwner";
 
 export async function POST(request) {
+  // The Products screen is owner-only; without a role check a staff session
+  // could create and edit catalog entries (including unit_cost) by posting
+  // here directly.
+  const auth = await requireOwner();
+  if (auth.error) return auth.error;
+  const { user } = auth;
+
   const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-  if (!user) {
-    return NextResponse.json({ error: "Not signed in." }, { status: 401 });
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
   }
 
-  const body = await request.json();
   const sku = (body.sku ?? "").trim().toUpperCase();
   const name = (body.name ?? "").trim();
   if (!sku || !name) {
