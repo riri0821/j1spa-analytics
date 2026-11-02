@@ -1,0 +1,17 @@
+{
+  "generatedAt": null,
+  "note": "simulated",
+  "window": { "from": null, "to": null },
+  "sales": { "first": null, "last": null, "count": 0 },
+  "services": { "first": null, "last": null, "count": 0 },
+  "howToRemove": [
+    "Placeholder - scripts/simulate-recent-activity.mjs --apply overwrites this file",
+    "with the real inserted id ranges. Services have no note column, so the",
+    "service_id range recorded here is the only way to identify them precisely.",
+    "delete from sale_items where sale_id between <sales.first> and <sales.last>;",
+    "delete from stock_movements where note = 'simulated';",
+    "delete from sales where note = 'simulated';",
+    "delete from services where service_id between <services.first> and <services.last>;",
+    "-- then recompute products.stock_on_hand, or restore it from the backup schema"
+  ]
+}

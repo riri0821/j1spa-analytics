@@ -8,7 +8,8 @@
     "start": "next start",
     "lint": "eslint",
     "check:ledger": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/ledger.check.mjs",
-    "check:gross-net": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/grossNetRange.check.mjs"
+    "check:gross-net": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/grossNetRange.check.mjs",
+    "check:backfill": "node scripts/backfillPlan.check.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",
