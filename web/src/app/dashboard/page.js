@@ -67,12 +67,18 @@ export default async function DashboardPage() {
             deltaText={deltaText}
             trend={marginTrend}
             secondary={[
-              { label: "Total units in stock", value: summary.totalUnitsInStock, href: "/products" },
+              {
+                label: "Total units in stock",
+                // Same en-US formatting as the Stock by Category donut's centre
+                // total, so the two read identically and not merely equal.
+                value: summary.totalUnitsInStock.toLocaleString("en-US"),
+                href: "/products",
+              },
               { label: "Restocking items (critical)", value: summary.restockingCritical, href: "/decision-support" },
             ]}
           />
           <Card title="Stock by Category" subtitle="Share of units on hand">
-            <StockByCategoryChart data={summary.categoryTotals} />
+            <StockByCategoryChart data={summary.categoryTotals} totalUnits={summary.totalUnitsInStock} />
           </Card>
         </div>
 

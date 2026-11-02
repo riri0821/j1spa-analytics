@@ -45,24 +45,46 @@ export async function getMarginTrend(supabase) {
     }));
 }
 
+// PostgREST answers with at most 1000 rows per request, so a plain select
+// starts silently dropping products once the active catalog passes that
+// (~576 today). Every total on the dashboard is summed from these rows, so
+// a truncated read would understate the stock figures without erroring.
+const PAGE_SIZE = 1000;
+
+async function fetchAllRows(query) {
+  const all = [];
+  for (let offset = 0; ; offset += PAGE_SIZE) {
+    const { data, error } = await query().range(offset, offset + PAGE_SIZE - 1);
+    if (error) {
+      // Degrade like the other readers here rather than 500 the whole
+      // dashboard, but say plainly that the totals below are now short.
+      console.error(`paged read failed at offset ${offset} - totals will be understated:`, error.message);
+      return all;
+    }
+    all.push(...(data ?? []));
+    if (!data || data.length < PAGE_SIZE) return all;
+  }
+}
+
 export async function getProductPerformance(supabase) {
-  const [{ data: velocity }, { data: products }] = await Promise.all([
-    supabase.from("vw_product_velocity").select("sku, revenue_90d, units_90d, gross_profit_90d"),
-    supabase
-      .from("products")
-      .select("sku, name, category, stock_on_hand, reorder_point")
-      .eq("is_active", true),
+  const [velocity, products] = await Promise.all([
+    fetchAllRows(() =>
+      supabase.from("vw_product_velocity").select("sku, revenue_90d, units_90d, gross_profit_90d")
+    ),
+    fetchAllRows(() =>
+      supabase.from("products").select("sku, name, category, stock_on_hand, reorder_point").eq("is_active", true)
+    ),
   ]);
 
-  const velBySku = new Map((velocity ?? []).map((v) => [v.sku, v]));
+  const velBySku = new Map(velocity.map((v) => [v.sku, v]));
 
   // top 40% by trailing-90d units are "Fast-moving"
-  const unitsDesc = (products ?? [])
+  const unitsDesc = products
     .map((p) => Number(velBySku.get(p.sku)?.units_90d ?? 0))
     .sort((a, b) => b - a);
   const cutoff = unitsDesc.length ? unitsDesc[Math.floor(unitsDesc.length * 0.4)] : 0;
 
-  const rows = (products ?? []).map((p) => {
+  const rows = products.map((p) => {
     const v = velBySku.get(p.sku);
     const units = Number(v?.units_90d ?? 0);
     const movement = units === 0 ? "No recent sales" : units >= Math.max(cutoff, 1) ? "Fast-moving" : "Slow-moving";
