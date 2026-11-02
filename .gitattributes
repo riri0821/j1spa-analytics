@@ -1,0 +1,9 @@
+# Line endings are decided here rather than per-clone by core.autocrlf, so a
+# Windows checkout and a Linux/CI checkout produce byte-identical files. LF in
+# the repository and in the working tree; without this, whole files can show up
+# as modified on one machine and clean on another.
+* text=auto eol=lf
+
+# Windows batch files are the exception - cmd.exe needs CRLF to run them.
+*.bat text eol=crlf
+*.cmd text eol=crlf
