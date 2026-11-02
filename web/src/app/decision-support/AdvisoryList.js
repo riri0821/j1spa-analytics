@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { theme, CATEGORICAL } from "../dashboard/theme";
+import { theme, CATEGORICAL, ADVISORY_TYPE } from "../dashboard/theme";
 import AdvisoryCard from "./AdvisoryCard";
 import PaginationControls from "@/components/PaginationControls";
 
@@ -18,10 +18,10 @@ const TYPE_LABEL = {
 const NO_ACTION = "no_action";
 
 const CHIPS = [
-  { type: "low_stock", label: "Low stock", severity: "critical" },
-  { type: "demand_spike", label: "Demand spike", severity: "warning" },
-  { type: "overstock", label: "Overstock", severity: "warning" },
-  { type: NO_ACTION, label: "No action needed", severity: "info" },
+  { type: "low_stock", label: "Low stock" },
+  { type: "demand_spike", label: "Demand spike" },
+  { type: "overstock", label: "Overstock" },
+  { type: NO_ACTION, label: "No action needed" },
 ];
 
 const fmt = (n) => Number(n).toLocaleString("en-US");
@@ -34,7 +34,6 @@ export default function AdvisoryList({
   noActionUnits,
   activeProductCount,
   totalUnits,
-  severityColor,
 }) {
   const [typeFilter, setTypeFilter] = useState(null);
   const [page, setPage] = useState(1);
@@ -92,7 +91,7 @@ export default function AdvisoryList({
               label={c.label}
               count={countFor(c.type)}
               units={unitsFor(c.type)}
-              color={severityColor[c.severity]}
+              color={ADVISORY_TYPE[c.type]}
               active={typeFilter === c.type}
               onClick={() => toggleFilter(c.type)}
             />
@@ -128,7 +127,7 @@ export default function AdvisoryList({
               key={`${a.sku}-${a.type}`}
               advisory={a}
               typeLabel={TYPE_LABEL[a.type]}
-              severityColor={severityColor[a.severity]}
+              accentColor={ADVISORY_TYPE[a.type]}
             />
           ))}
         </div>

@@ -25,6 +25,21 @@ export const STATUS = {
   Stable: "#0ca30c",
 };
 
+// Advisory/stock-state colors keyed by TYPE, not by severity. Severity is
+// too coarse to colour by: demand_spike and overstock are both "warning",
+// which made their chips identical. Defined once here, and derived from
+// STATUS above wherever a matching state already has a reserved hex, so
+// Decision Support and the dashboard's Tracking table cannot drift apart.
+export const ADVISORY_TYPE = {
+  low_stock: STATUS["Low stock"], // same red as Tracking's "Low stock"
+  // Orange, between that red and the amber below. It clears 3:1 on the card
+  // background (6.5:1) and is a distinct hue from both, but the chips keep
+  // their text labels so colour is never the only cue.
+  demand_spike: "#f97316",
+  overstock: STATUS.Overstocked, // same amber as Tracking's "Overstocked"
+  no_action: STATUS.Stable, // same green as Tracking's "Stable"
+};
+
 // Sequential blue ramp, light->dark (dataviz skill) - used for the heatmap.
 export const SEQUENTIAL = ["#cde2fb", "#86b6ef", "#3987e5", "#1c5cab", "#0d366b"];
 

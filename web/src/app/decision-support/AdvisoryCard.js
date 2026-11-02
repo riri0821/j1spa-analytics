@@ -17,7 +17,7 @@ const TYPE_LABEL = {
   overstock: "Overstock",
 };
 
-export default function AdvisoryCard({ advisory: a, typeLabel, severityColor }) {
+export default function AdvisoryCard({ advisory: a, typeLabel, accentColor }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState(false);
@@ -82,7 +82,7 @@ export default function AdvisoryCard({ advisory: a, typeLabel, severityColor }) 
         <div className="flex items-center gap-2">
           <span
             className="rounded px-2 py-0.5 text-xs font-medium"
-            style={{ backgroundColor: `${severityColor}22`, color: severityColor }}
+            style={{ backgroundColor: `${accentColor}22`, color: accentColor }}
           >
             {typeLabel}
           </span>
@@ -207,7 +207,7 @@ export default function AdvisoryCard({ advisory: a, typeLabel, severityColor }) 
         <ul className="mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs" style={{ color: theme.textMuted }}>
           {a.rules.map((r) => (
             <li key={r.id}>
-              <span style={{ color: r.result ? severityColor : theme.textMuted }}>{r.id}</span> {r.expr} →{" "}
+              <span style={{ color: r.result ? accentColor : theme.textMuted }}>{r.id}</span> {r.expr} →{" "}
               {r.result ? "TRUE" : "FALSE"}
             </li>
           ))}

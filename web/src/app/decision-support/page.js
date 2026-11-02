@@ -1,19 +1,10 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { evaluateDecisionSupport } from "@/lib/decisionSupport";
-import { theme, STATUS } from "../dashboard/theme";
+import { theme } from "../dashboard/theme";
 import Sidebar from "../dashboard/Sidebar";
 import RefreshButton from "../dashboard/RefreshButton";
 import AdvisoryList from "./AdvisoryList";
-
-// Advisory severity uses the same reserved status hexes as the dashboard's
-// Low stock/Overstocked/Stable badges (dataviz skill) - "critical" maps to
-// the same red as "Low stock" there, "warning" to the same amber.
-const SEVERITY_COLOR = {
-  critical: STATUS["Low stock"],
-  warning: STATUS.Overstocked,
-  info: STATUS.Stable,
-};
 
 export default async function DecisionSupportPage() {
   const supabase = await createClient();
@@ -55,7 +46,6 @@ export default async function DecisionSupportPage() {
           noActionUnits={result.noActionUnits}
           activeProductCount={result.activeProductCount}
           totalUnits={result.totalUnits}
-          severityColor={SEVERITY_COLOR}
         />
       </main>
     </div>
