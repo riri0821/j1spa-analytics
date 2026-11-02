@@ -47,7 +47,16 @@ export default async function DecisionSupportPage() {
           </div>
         </div>
 
-        <AdvisoryList advisories={result.advisories} byType={result.byType} severityColor={SEVERITY_COLOR} />
+        <AdvisoryList
+          advisories={result.advisories}
+          byType={result.byType}
+          unitsByType={result.unitsByType}
+          noAction={result.noAction}
+          noActionUnits={result.noActionUnits}
+          activeProductCount={result.activeProductCount}
+          totalUnits={result.totalUnits}
+          severityColor={SEVERITY_COLOR}
+        />
       </main>
     </div>
   );

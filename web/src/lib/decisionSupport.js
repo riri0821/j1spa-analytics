@@ -7,6 +7,8 @@
  * stays in Next.js/Postgres rather than calling the Python forecast
  * service - no heavy stats library needed for this one.
  */
+import { fetchAllRows } from "./analytics";
+
 const LEAD_TIME_DAYS = 30; // config.SUPPLIER_LEAD_TIME_DAYS
 const SPIKE_THRESHOLD_PCT = 30.0; // config.SPIKE_THRESHOLD_PCT
 const OVERSTOCK_DOS_DAYS = 90; // config.OVERSTOCK_DOS_DAYS
@@ -153,9 +155,19 @@ function buildTypeAdvisory(type, p, ctx, isManualType) {
 }
 
 export async function evaluateDecisionSupport(supabase) {
-  const [{ data: velocityRows }, { data: products }, { data: monthlyRows }, { data: overrideRows }] = await Promise.all([
-    supabase.from("vw_product_velocity").select("sku, units_90d"),
-    supabase.from("products").select("product_id, sku, name, stock_on_hand, reorder_point").eq("is_active", true),
+  const [velocityRows, products, { data: monthlyRows }, { data: overrideRows }] = await Promise.all([
+    // Both paged: a plain select stops at PostgREST's 1000-row default, which
+    // would quietly drop products from the evaluation (and from the chip
+    // totals below). .order() is what makes the paging stable - without a
+    // sort, range requests can return overlapping pages.
+    fetchAllRows(() => supabase.from("vw_product_velocity").select("sku, units_90d").order("sku")),
+    fetchAllRows(() =>
+      supabase
+        .from("products")
+        .select("product_id, sku, name, stock_on_hand, reorder_point")
+        .eq("is_active", true)
+        .order("product_id")
+    ),
     // one query for every SKU's monthly demand, instead of one round trip
     // per product (576 separate calls against the real catalog - fine for
     // a handful of test products, not fine at real scale). Returns 40,000+
@@ -184,7 +196,7 @@ export async function evaluateDecisionSupport(supabase) {
   // owner's override of which type shows for that SKU, outranking the
   // rule engine's own result. See sql/supabase_add_advisory_overrides.sql.
   const manualTypeMap = new Map((overrideRows ?? []).map((r) => [r.product_id, r.manual_type]));
-  const velocityMap = new Map((velocityRows ?? []).map((r) => [r.sku, Number(r.units_90d) || 0]));
+  const velocityMap = new Map(velocityRows.map((r) => [r.sku, Number(r.units_90d) || 0]));
   const nonZero = [...velocityMap.values()].filter((v) => v > 0);
   const velocityMedian = median(nonZero);
 
@@ -194,12 +206,12 @@ export async function evaluateDecisionSupport(supabase) {
     rowsBySku.get(r.sku).push(r);
   }
   const monthlyBySku = new Map();
-  for (const p of products ?? []) {
+  for (const p of products) {
     monthlyBySku.set(p.sku, gapFilledUnits(rowsBySku.get(p.sku) ?? []));
   }
 
   const advisories = [];
-  for (const p of products ?? []) {
+  for (const p of products) {
     const units = monthlyBySku.get(p.sku) ?? [];
     const { fc30, avg12 } = forecastAndAvg(units);
     const perDay = fc30 > 0 ? fc30 / 30 : 0;
@@ -261,14 +273,41 @@ export async function evaluateDecisionSupport(supabase) {
     await supabase.from("alerts").insert(rows);
   }
 
+  // Each product yields at most one advisory (one finalType, or none), so
+  // the products with no advisory are exactly the rest of the active
+  // catalog - which is what lets the four chip counts add up to the active
+  // product count, and the four unit totals to total stock on hand.
   const byType = {};
-  for (const a of advisories) byType[a.type] = (byType[a.type] ?? 0) + 1;
+  const unitsByType = {};
+  for (const a of advisories) {
+    byType[a.type] = (byType[a.type] ?? 0) + 1;
+    unitsByType[a.type] = (unitsByType[a.type] ?? 0) + a.onHand;
+  }
+
+  const advised = new Set(advisories.map((a) => a.productId));
+  const noAction = products
+    .filter((p) => !advised.has(p.product_id))
+    .map((p) => ({
+      productId: p.product_id,
+      sku: p.sku,
+      name: p.name,
+      onHand: p.stock_on_hand,
+      reorderPoint: p.reorder_point,
+    }))
+    .sort((a, b) => a.sku.localeCompare(b.sku));
 
   return {
     batchId,
     generatedAt: new Date().toISOString(),
     count: advisories.length,
     byType,
+    unitsByType,
     advisories,
+    noAction,
+    noActionUnits: noAction.reduce((sum, p) => sum + p.onHand, 0),
+    activeProductCount: products.length,
+    // Same definition as the dashboard's "Total units in stock": stock_on_hand
+    // summed over active products.
+    totalUnits: products.reduce((sum, p) => sum + p.stock_on_hand, 0),
   };
 }

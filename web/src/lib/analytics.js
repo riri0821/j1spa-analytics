@@ -51,7 +51,7 @@ export async function getMarginTrend(supabase) {
 // a truncated read would understate the stock figures without erroring.
 const PAGE_SIZE = 1000;
 
-async function fetchAllRows(query) {
+export async function fetchAllRows(query) {
   const all = [];
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const { data, error } = await query().range(offset, offset + PAGE_SIZE - 1);
@@ -69,7 +69,9 @@ async function fetchAllRows(query) {
 export async function getProductPerformance(supabase) {
   const [velocity, products] = await Promise.all([
     fetchAllRows(() =>
-      supabase.from("vw_product_velocity").select("sku, revenue_90d, units_90d, gross_profit_90d")
+      // .order() is what makes the paging stable - without a sort, each
+      // range request may order rows differently and pages can overlap.
+      supabase.from("vw_product_velocity").select("sku, revenue_90d, units_90d, gross_profit_90d").order("sku")
     ),
     fetchAllRows(() =>
       supabase.from("products").select("sku, name, category, stock_on_hand, reorder_point").eq("is_active", true)
