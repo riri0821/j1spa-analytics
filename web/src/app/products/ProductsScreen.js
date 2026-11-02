@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { theme, CATEGORICAL } from "../dashboard/theme";
 import PaginationControls from "@/components/PaginationControls";
+import { CategorySelect, fetchCategoryCounts } from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-2 py-1.5 text-sm w-full";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
@@ -27,6 +28,11 @@ export default function ProductsScreen() {
   const [products, setProducts] = useState([]);
   const [categories, setCategories] = useState([]);
   const [search, setSearch] = useState("");
+  // Filter is applied server-side, so picking a category shows all of it
+  // rather than whichever of its items happened to fall inside the 500-row
+  // page the unfiltered query returns.
+  const [categoryFilter, setCategoryFilter] = useState("");
+  const [categoryCounts, setCategoryCounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -34,7 +40,7 @@ export default function ProductsScreen() {
   const [page, setPage] = useState(1);
 
   const loadProducts = useCallback(
-    async (term) => {
+    async (term, category) => {
       setLoading(true);
       setError("");
       const safeTerm = (term ?? "").replace(/[,()]/g, "");
@@ -45,6 +51,8 @@ export default function ProductsScreen() {
         )
         .order("name")
         .limit(500);
+
+      if (category) query = query.eq("category", category);
 
       if (safeTerm) {
         query = query.or(
@@ -64,20 +72,29 @@ export default function ProductsScreen() {
     // Fetch-on-mount: setLoading/setError inside loadProducts run before
     // its first await, which is the standard pattern here (not a loop).
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    loadProducts("");
-    supabase
-      .from("products")
-      .select("category")
-      .then(({ data }) => {
-        const unique = [...new Set((data ?? []).map((r) => r.category))].sort();
-        setCategories(unique);
-      });
+    loadProducts("", "");
+    // activeOnly off: this table lists deactivated products too, so every
+    // row has to stay reachable from the filter (and selectable in the form).
+    fetchCategoryCounts(supabase, { activeOnly: false }).then(({ categories: list, error: failed }) => {
+      if (failed) {
+        console.error("category list failed:", failed);
+        return;
+      }
+      setCategoryCounts(list);
+      setCategories(list.map((c) => c.category));
+    });
   }, [loadProducts, supabase]);
 
   function handleSearchSubmit(e) {
     e.preventDefault();
     setPage(1);
-    loadProducts(search);
+    loadProducts(search, categoryFilter);
+  }
+
+  function changeCategoryFilter(next) {
+    setCategoryFilter(next);
+    setPage(1);
+    loadProducts(search, next);
   }
 
   const totalPages = Math.max(1, Math.ceil(products.length / PAGE_SIZE));
@@ -122,7 +139,7 @@ export default function ProductsScreen() {
     }
     setForm(null);
     setNotice(form.product_id ? "Product updated." : "Product created.");
-    loadProducts(search);
+    loadProducts(search, categoryFilter);
   }
 
   async function handleDelete(product_id) {
@@ -139,13 +156,19 @@ export default function ProductsScreen() {
       return;
     }
     setNotice(body.message);
-    loadProducts(search);
+    loadProducts(search, categoryFilter);
   }
 
   return (
     <div className="flex flex-col gap-4" style={{ color: theme.textSecondary }}>
       <div className="flex items-center justify-between gap-4">
-        <form onSubmit={handleSearchSubmit} className="flex gap-2">
+        <form onSubmit={handleSearchSubmit} className="flex flex-wrap gap-2">
+          <CategorySelect
+            value={categoryFilter}
+            onChange={changeCategoryFilter}
+            categories={categoryCounts}
+            className="w-48"
+          />
           <input
             value={search}
             onChange={(e) => setSearch(e.target.value)}

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from "recharts";
 import { theme, CATEGORICAL, STATUS } from "../dashboard/theme";
+import { CategorySkuSelect } from "@/components/CategoryProductPicker";
 
 const MODELS = ["MA", "WMA", "Linear Regression", "ARIMA", "Holt-Winters"];
 const HORIZONS = [7, 14, 30, 60, 90];
@@ -18,10 +19,12 @@ const PREFETCH_TTL_MS = 60_000;
 const PREFETCH_MAX_ENTRIES = 12;
 
 export default function ForecastWorkspace({ products, initialSku = "" }) {
-  // Pre-filled when the page is opened from a product's stock ledger
-  // (/forecasting?sku=...). The comparison still waits for the button; only
-  // the background prefetch below reacts to the SKU being set.
-  const [skuInput, setSkuInput] = useState(initialSku);
+  // Pre-selected when the page is opened from a product's stock ledger
+  // (/forecasting?sku=...) - CategorySkuSelect seeds its category from this
+  // SKU so both selects land on the right product. The comparison still
+  // waits for the button; only the background prefetch below reacts to the
+  // SKU being set.
+  const [sku, setSku] = useState(initialSku);
   const [horizon, setHorizon] = useState(30);
   const [selectedModels, setSelectedModels] = useState(new Set(MODELS));
   const [loading, setLoading] = useState(false);
@@ -31,10 +34,9 @@ export default function ForecastWorkspace({ products, initialSku = "" }) {
   const productBySku = useMemo(() => new Map(products.map((p) => [p.sku, p])), [products]);
   const prefetches = useRef(new Map());
 
-  const resolvedSku = useMemo(() => {
-    const sku = skuInput.split(" — ")[0].trim();
-    return productBySku.has(sku) ? sku : null;
-  }, [skuInput, productBySku]);
+  // The select can only offer real SKUs, but this still guards against a
+  // stale ?sku= for a product that has since been deactivated.
+  const resolvedSku = useMemo(() => (productBySku.has(sku) ? sku : null), [sku, productBySku]);
 
   // Sorted, so toggling a pill off and back on produces the same key and the
   // same URL. The service treats ?models= as a set, so order never mattered
@@ -91,7 +93,7 @@ export default function ForecastWorkspace({ products, initialSku = "" }) {
 
   async function runComparison() {
     if (!resolvedSku) {
-      setError("Pick a valid SKU from the list.");
+      setError("Pick a category and an item first.");
       return;
     }
     setError("");
@@ -134,19 +136,7 @@ export default function ForecastWorkspace({ products, initialSku = "" }) {
         className="flex flex-wrap items-center gap-3 rounded-lg border p-4"
         style={{ backgroundColor: theme.cardBg, borderColor: theme.border }}
       >
-        <input
-          list="sku-options"
-          value={skuInput}
-          onChange={(e) => setSkuInput(e.target.value)}
-          placeholder="Search SKU or name..."
-          className="w-64 rounded border px-3 py-1.5 text-sm"
-          style={{ backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary }}
-        />
-        <datalist id="sku-options">
-          {products.map((p) => (
-            <option key={p.sku} value={`${p.sku} — ${p.name}`} />
-          ))}
-        </datalist>
+        <CategorySkuSelect products={products} value={sku} onChange={setSku} />
 
         <select
           value={horizon}

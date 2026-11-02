@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { theme } from "../dashboard/theme";
 import StockInTracker from "./StockInTracker";
+import CategoryProductPicker from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
@@ -30,8 +31,8 @@ export default function StockInScreen() {
 
   const [tab, setTab] = useState("entry"); // "entry" | "tracker"
 
-  const [search, setSearch] = useState("");
-  const [results, setResults] = useState([]);
+  // Bumped after a stock-in so the picker re-reads stock_on_hand.
+  const [catalogVersion, setCatalogVersion] = useState(0);
   const [cart, setCart] = useState([]); // [{product_id, sku, name, stock_on_hand, qty}]
   const [supplierName, setSupplierName] = useState("");
   const [confirming, setConfirming] = useState(false);
@@ -48,24 +49,6 @@ export default function StockInScreen() {
   const [quickText, setQuickText] = useState("");
   const [quickLines, setQuickLines] = useState(null); // null = not parsed yet
 
-  const searchProducts = useCallback(
-    async (term) => {
-      const safeTerm = term.replace(/[,()]/g, "");
-      let query = supabase
-        .from("products")
-        .select("product_id, sku, name, brand, supplier, stock_on_hand, reorder_point")
-        .eq("is_active", true)
-        .order("name")
-        .limit(100);
-      if (safeTerm) {
-        query = query.or(`name.ilike.%${safeTerm}%,sku.ilike.%${safeTerm}%,brand.ilike.%${safeTerm}%`);
-      }
-      const { data } = await query;
-      setResults(data ?? []);
-    },
-    [supabase]
-  );
-
   const loadCatalog = useCallback(async () => {
     const { data } = await supabase
       .from("products")
@@ -78,14 +61,8 @@ export default function StockInScreen() {
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    searchProducts("");
     loadCatalog();
-  }, [searchProducts, loadCatalog]);
-
-  function handleSearchSubmit(e) {
-    e.preventDefault();
-    searchProducts(search);
-  }
+  }, [loadCatalog]);
 
   function addToCart(p) {
     setCart((prev) => {
@@ -122,7 +99,9 @@ export default function StockInScreen() {
       setError(updateError.message);
       return;
     }
-    setResults((prev) => prev.map((p) => (p.product_id === product_id ? { ...p, supplier: value } : p)));
+    // The picker owns the visible rows, so re-read them rather than patching
+    // a local copy; the quick-entry catalog is still updated in place.
+    setCatalogVersion((v) => v + 1);
     setCatalog((prev) => prev.map((p) => (p.product_id === product_id ? { ...p, supplier: value } : p)));
     setEditingSupplierId(null);
   }
@@ -189,7 +168,7 @@ export default function StockInScreen() {
 
     // supplier is applied server-side (security definer) inside the RPC
     // itself, not a separate client update - products writes are
-    // owner-only under RLS, but Stock In is also used by staff.
+    // owner-only under RLS, and the RPC checks the owner role itself.
     const { data, error: rpcError } = await supabase.rpc("record_stock_movements", {
       items,
       supplier: supplierName.trim() || null,
@@ -204,7 +183,7 @@ export default function StockInScreen() {
     setRecorded(data.recorded);
     setCart([]);
     setSupplierName("");
-    searchProducts(search);
+    setCatalogVersion((v) => v + 1);
     loadCatalog();
   }
 
@@ -398,100 +377,76 @@ export default function StockInScreen() {
             </div>
           </div>
 
-          {/* Product search + results */}
-          <div className="flex flex-col gap-3">
-            <form onSubmit={handleSearchSubmit} className="flex gap-2">
-              <input
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search name, SKU, brand..."
-                className={`w-full ${inputClass}`}
-                style={inputStyle}
-              />
-              <button
-                type="submit"
-                className="rounded border px-3 py-1.5 text-sm"
-                style={{ borderColor: theme.border, color: theme.textSecondary }}
-              >
-                Search
-              </button>
-            </form>
-            <div className="max-h-96 overflow-y-auto rounded border" style={{ borderColor: theme.border }}>
-              <table className="w-full text-left text-sm">
-                <thead style={{ backgroundColor: theme.cardBgAlt, color: theme.textMuted }}>
-                  <tr>
-                    <th className="px-3 py-2 font-normal">SKU</th>
-                    <th className="px-3 py-2 font-normal">Name</th>
-                    <th className="px-3 py-2 font-normal">Supplier</th>
-                    <th className="px-3 py-2 text-right font-normal">Stock</th>
-                    <th className="px-3 py-2 text-right font-normal">Reorder pt</th>
-                    <th className="px-3 py-2"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {results.map((p) => (
-                    <tr key={p.product_id} className="border-t" style={{ borderColor: theme.border }}>
-                      <td
-                        onClick={() => startEditSupplier(p)}
-                        title="Click to edit supplier"
-                        className="cursor-pointer px-3 py-2 font-mono hover:underline"
-                        style={{ color: theme.textPrimary }}
+          {/* Product picker: category first, then the item */}
+          <CategoryProductPicker
+            columns="product_id, sku, name, category, brand, supplier, stock_on_hand, reorder_point"
+            searchFields={["name", "sku", "brand"]}
+            searchPlaceholder="Search name, SKU, brand..."
+            refreshKey={catalogVersion}
+            columnCount={6}
+            tableHead={
+              <tr>
+                <th className="px-3 py-2 font-normal">SKU</th>
+                <th className="px-3 py-2 font-normal">Name</th>
+                <th className="px-3 py-2 font-normal">Supplier</th>
+                <th className="px-3 py-2 text-right font-normal">Stock</th>
+                <th className="px-3 py-2 text-right font-normal">Reorder pt</th>
+                <th className="px-3 py-2"></th>
+              </tr>
+            }
+            renderRow={(p) => (
+              <>
+                <td
+                  onClick={() => startEditSupplier(p)}
+                  title="Click to edit supplier"
+                  className="cursor-pointer px-3 py-2 font-mono hover:underline"
+                  style={{ color: theme.textPrimary }}
+                >
+                  {p.sku}
+                </td>
+                <td className="px-3 py-2">{p.name}</td>
+                <td className="px-3 py-2">
+                  {editingSupplierId === p.product_id ? (
+                    <div className="flex items-center gap-1">
+                      <input
+                        autoFocus
+                        value={supplierDraft}
+                        onChange={(e) => setSupplierDraft(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") saveSupplier(p.product_id);
+                          if (e.key === "Escape") setEditingSupplierId(null);
+                        }}
+                        className="w-28 rounded border px-1.5 py-0.5 text-xs"
+                        style={inputStyle}
+                      />
+                      <button
+                        onClick={() => saveSupplier(p.product_id)}
+                        className="text-xs font-medium"
+                        style={{ color: theme.accent }}
                       >
-                        {p.sku}
-                      </td>
-                      <td className="px-3 py-2">{p.name}</td>
-                      <td className="px-3 py-2">
-                        {editingSupplierId === p.product_id ? (
-                          <div className="flex items-center gap-1">
-                            <input
-                              autoFocus
-                              value={supplierDraft}
-                              onChange={(e) => setSupplierDraft(e.target.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Enter") saveSupplier(p.product_id);
-                                if (e.key === "Escape") setEditingSupplierId(null);
-                              }}
-                              className="w-28 rounded border px-1.5 py-0.5 text-xs"
-                              style={inputStyle}
-                            />
-                            <button
-                              onClick={() => saveSupplier(p.product_id)}
-                              className="text-xs font-medium"
-                              style={{ color: theme.accent }}
-                            >
-                              Save
-                            </button>
-                          </div>
-                        ) : (
-                          <span style={{ color: p.supplier ? theme.textSecondary : theme.textMuted }}>
-                            {p.supplier || "Unknown"}
-                          </span>
-                        )}
-                      </td>
-                      <td className="px-3 py-2 text-right">{p.stock_on_hand}</td>
-                      <td className="px-3 py-2 text-right">{p.reorder_point}</td>
-                      <td className="px-3 py-2 text-right">
-                        <button
-                          onClick={() => addToCart(p)}
-                          className="rounded px-2 py-1 text-xs font-medium"
-                          style={{ backgroundColor: theme.accent, color: "#05230f" }}
-                        >
-                          Add
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                  {results.length === 0 && (
-                    <tr>
-                      <td colSpan={6} className="px-3 py-4 text-center" style={{ color: theme.textMuted }}>
-                        No products found.
-                      </td>
-                    </tr>
+                        Save
+                      </button>
+                    </div>
+                  ) : (
+                    <span style={{ color: p.supplier ? theme.textSecondary : theme.textMuted }}>
+                      {p.supplier || "Unknown"}
+                    </span>
                   )}
-                </tbody>
-              </table>
-            </div>
-          </div>
+                </td>
+                <td className="px-3 py-2 text-right">{p.stock_on_hand}</td>
+                <td className="px-3 py-2 text-right">{p.reorder_point}</td>
+                <td className="px-3 py-2 text-right">
+                  <button
+                    onClick={() => addToCart(p)}
+                    className="rounded px-2 py-1 text-xs font-medium"
+                    style={{ backgroundColor: theme.accent, color: "#05230f" }}
+                  >
+                    Add
+                  </button>
+                </td>
+              </>
+            )}
+          />
         </>
       )}
     </div>

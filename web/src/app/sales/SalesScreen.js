@@ -6,6 +6,7 @@ import { theme } from "../dashboard/theme";
 import SalesTracker from "./SalesTracker";
 import ServicesScreen from "./ServicesScreen";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
+import CategoryProductPicker from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
@@ -14,8 +15,8 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
   const supabase = createClient();
 
   const [tab, setTab] = useState(initialTab); // "entry" | "services" | "tracker"
-  const [search, setSearch] = useState("");
-  const [results, setResults] = useState([]);
+  // Bumped after a sale so both pickers re-read stock_on_hand.
+  const [catalogVersion, setCatalogVersion] = useState(0);
   const [cart, setCart] = useState([]); // [{product_id, sku, name, unit_price, stock_on_hand, qty}]
   const [note, setNote] = useState("");
   const [customerName, setCustomerName] = useState("");
@@ -31,27 +32,7 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
 
   // Editing an already-confirmed sale from the Recent sales list.
   const [editingSale, setEditingSale] = useState(null);
-  const [editSearch, setEditSearch] = useState("");
-  const [editResults, setEditResults] = useState([]);
   const [editSaving, setEditSaving] = useState(false);
-
-  const searchProducts = useCallback(
-    async (term) => {
-      const safeTerm = term.replace(/[,()]/g, "");
-      let query = supabase
-        .from("products")
-        .select("product_id, sku, name, category, brand, unit_price, stock_on_hand")
-        .eq("is_active", true)
-        .order("name")
-        .limit(100);
-      if (safeTerm) {
-        query = query.or(`name.ilike.%${safeTerm}%,sku.ilike.%${safeTerm}%,brand.ilike.%${safeTerm}%`);
-      }
-      const { data } = await query;
-      setResults(data ?? []);
-    },
-    [supabase]
-  );
 
   const loadRecentSales = useCallback(async () => {
     const { data: sales } = await supabase
@@ -90,15 +71,11 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
   }, [supabase, role, userId]);
 
   useEffect(() => {
+    // Fetch-on-mount: setState lands before the first await, which is the
+    // established pattern on these screens (not a render loop).
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    searchProducts("");
     loadRecentSales();
-  }, [searchProducts, loadRecentSales]);
-
-  function handleSearchSubmit(e) {
-    e.preventDefault();
-    searchProducts(search);
-  }
+  }, [loadRecentSales]);
 
   function addToCart(p) {
     setCart((prev) => {
@@ -152,7 +129,7 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
     setCustomerAddress("");
     setCustomerVehicleBrand("");
     setShowCustomerDetails(false);
-    searchProducts(search); // refresh stock_on_hand shown in results
+    setCatalogVersion((v) => v + 1); // refresh stock_on_hand shown in the picker
     loadRecentSales();
   }
 
@@ -166,7 +143,7 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
       return;
     }
     setNotice(`Sale #${saleId} undone.`);
-    searchProducts(search);
+    setCatalogVersion((v) => v + 1);
     loadRecentSales();
   }
 
@@ -200,29 +177,10 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
       customer_address: row.customer_address ?? "",
       customer_vehicle_brand: row.customer_vehicle_brand ?? "",
     });
-    setEditSearch("");
-    setEditResults([]);
   }
 
   function closeEditSale() {
     setEditingSale(null);
-    setEditSearch("");
-    setEditResults([]);
-  }
-
-  async function editSearchProducts(term) {
-    const safeTerm = term.replace(/[,()]/g, "");
-    let query = supabase
-      .from("products")
-      .select("product_id, sku, name, unit_price, stock_on_hand")
-      .eq("is_active", true)
-      .order("name")
-      .limit(50);
-    if (safeTerm) {
-      query = query.or(`name.ilike.%${safeTerm}%,sku.ilike.%${safeTerm}%`);
-    }
-    const { data } = await query;
-    setEditResults(data ?? []);
   }
 
   function addEditLine(p) {
@@ -273,7 +231,7 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
 
     setNotice(`Sale #${editingSale.sale_id} updated.`);
     closeEditSale();
-    searchProducts(search);
+    setCatalogVersion((v) => v + 1);
     loadRecentSales();
   }
 
@@ -352,67 +310,43 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
           {notice && <p className="text-sm text-green-400">{notice}</p>}
 
           <div className="grid gap-6 lg:grid-cols-2">
-        {/* Product search + results */}
-        <div className="flex flex-col gap-3">
-          <form onSubmit={handleSearchSubmit} className="flex gap-2">
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search name, SKU, brand..."
-              className={`w-full ${inputClass}`}
-              style={inputStyle}
-            />
-            <button
-              type="submit"
-              className="rounded border px-3 py-1.5 text-sm"
-              style={{ borderColor: theme.border, color: theme.textSecondary }}
-            >
-              Search
-            </button>
-          </form>
-          <div className="max-h-96 overflow-y-auto rounded border" style={{ borderColor: theme.border }}>
-            <table className="w-full text-left text-sm">
-              <thead style={{ backgroundColor: theme.cardBgAlt, color: theme.textMuted }}>
-                <tr>
-                  <th className="px-3 py-2 font-normal">SKU</th>
-                  <th className="px-3 py-2 font-normal">Name</th>
-                  <th className="px-3 py-2 text-right font-normal">Price</th>
-                  <th className="px-3 py-2 text-right font-normal">Stock</th>
-                  <th className="px-3 py-2"></th>
-                </tr>
-              </thead>
-              <tbody>
-                {results.map((p) => (
-                  <tr key={p.product_id} className="border-t" style={{ borderColor: theme.border }}>
-                    <td className="px-3 py-2 font-mono" style={{ color: theme.textPrimary }}>
-                      {p.sku}
-                    </td>
-                    <td className="px-3 py-2">{p.name}</td>
-                    <td className="px-3 py-2 text-right">{Number(p.unit_price).toFixed(2)}</td>
-                    <td className="px-3 py-2 text-right">{p.stock_on_hand}</td>
-                    <td className="px-3 py-2 text-right">
-                      <button
-                        onClick={() => addToCart(p)}
-                        disabled={p.stock_on_hand <= 0}
-                        className="rounded px-2 py-1 text-xs font-medium disabled:opacity-40"
-                        style={{ backgroundColor: theme.accent, color: "#05230f" }}
-                      >
-                        Add
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-                {results.length === 0 && (
-                  <tr>
-                    <td colSpan={5} className="px-3 py-4 text-center" style={{ color: theme.textMuted }}>
-                      No products found.
-                    </td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        {/* Product picker: category first, then the item */}
+        <CategoryProductPicker
+          columns="product_id, sku, name, category, brand, unit_price, stock_on_hand"
+          searchFields={["name", "sku", "brand"]}
+          searchPlaceholder="Search name, SKU, brand..."
+          refreshKey={catalogVersion}
+          columnCount={5}
+          tableHead={
+            <tr>
+              <th className="px-3 py-2 font-normal">SKU</th>
+              <th className="px-3 py-2 font-normal">Name</th>
+              <th className="px-3 py-2 text-right font-normal">Price</th>
+              <th className="px-3 py-2 text-right font-normal">Stock</th>
+              <th className="px-3 py-2"></th>
+            </tr>
+          }
+          renderRow={(p) => (
+            <>
+              <td className="px-3 py-2 font-mono" style={{ color: theme.textPrimary }}>
+                {p.sku}
+              </td>
+              <td className="px-3 py-2">{p.name}</td>
+              <td className="px-3 py-2 text-right">{Number(p.unit_price).toFixed(2)}</td>
+              <td className="px-3 py-2 text-right">{p.stock_on_hand}</td>
+              <td className="px-3 py-2 text-right">
+                <button
+                  onClick={() => addToCart(p)}
+                  disabled={p.stock_on_hand <= 0}
+                  className="rounded px-2 py-1 text-xs font-medium disabled:opacity-40"
+                  style={{ backgroundColor: theme.accent, color: "#05230f" }}
+                >
+                  Add
+                </button>
+              </td>
+            </>
+          )}
+        />
 
         {/* Cart */}
         <div className="flex flex-col gap-3">
@@ -607,30 +541,32 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
               </table>
             </div>
 
-            <div className="flex gap-2">
-              <input
-                value={editSearch}
-                onChange={(e) => setEditSearch(e.target.value)}
-                placeholder="Add a product: search name or SKU..."
-                className={`w-full ${inputClass}`}
-                style={inputStyle}
-              />
-              <button
-                type="button"
-                onClick={() => editSearchProducts(editSearch)}
-                className="rounded border px-3 py-1.5 text-sm"
-                style={{ borderColor: theme.border, color: theme.textSecondary }}
-              >
-                Search
-              </button>
-            </div>
-            {editResults.length > 0 && (
-              <ul className="flex flex-col gap-1 rounded border p-2 text-xs" style={{ borderColor: theme.border }}>
-                {editResults.map((p) => (
-                  <li key={p.product_id} className="flex items-center justify-between gap-2">
-                    <span>
-                      <span className="font-mono">{p.sku}</span> {p.name} ({Number(p.unit_price).toFixed(2)})
-                    </span>
+            <p className="text-xs font-medium" style={{ color: theme.textSecondary }}>
+              Add a product
+            </p>
+            <CategoryProductPicker
+              columns="product_id, sku, name, category, unit_price, stock_on_hand"
+              searchFields={["name", "sku"]}
+              searchPlaceholder="Search name or SKU..."
+              refreshKey={catalogVersion}
+              maxHeightClass="max-h-56"
+              columnCount={4}
+              tableHead={
+                <tr>
+                  <th className="px-3 py-2 font-normal">SKU</th>
+                  <th className="px-3 py-2 font-normal">Name</th>
+                  <th className="px-3 py-2 text-right font-normal">Price</th>
+                  <th className="px-3 py-2"></th>
+                </tr>
+              }
+              renderRow={(p) => (
+                <>
+                  <td className="px-3 py-2 font-mono" style={{ color: theme.textPrimary }}>
+                    {p.sku}
+                  </td>
+                  <td className="px-3 py-2">{p.name}</td>
+                  <td className="px-3 py-2 text-right">{Number(p.unit_price).toFixed(2)}</td>
+                  <td className="px-3 py-2 text-right">
                     <button
                       onClick={() => addEditLine(p)}
                       className="rounded px-2 py-1 text-xs font-medium"
@@ -638,10 +574,10 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
                     >
                       Add
                     </button>
-                  </li>
-                ))}
-              </ul>
-            )}
+                  </td>
+                </>
+              )}
+            />
 
             <div className="grid gap-2 sm:grid-cols-2">
               <input
