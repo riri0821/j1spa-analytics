@@ -83,14 +83,13 @@ export default function AdvisoryList({
 
   return (
     <>
-      <div className="mb-2 flex items-start justify-between gap-4">
+      <div className="mb-2 flex items-center justify-between gap-4">
         <div className="flex flex-wrap gap-3">
           {CHIPS.map((c) => (
             <SummaryChip
               key={c.type}
               label={c.label}
               count={countFor(c.type)}
-              units={unitsFor(c.type)}
               color={ADVISORY_TYPE[c.type]}
               active={typeFilter === c.type}
               onClick={() => toggleFilter(c.type)}
@@ -176,27 +175,22 @@ function NoActionTable({ rows }) {
   );
 }
 
-function SummaryChip({ label, count, units, color, active, onClick }) {
+function SummaryChip({ label, count, color, active, onClick }) {
   return (
     <button
       onClick={onClick}
-      className="flex flex-col items-start gap-0.5 rounded-lg border px-4 py-2"
+      className="flex items-center gap-2 rounded-lg border px-4 py-2"
       style={{
         backgroundColor: active ? `${color}22` : theme.cardBg,
         borderColor: active ? color : theme.border,
       }}
     >
-      <span className="flex items-center gap-2">
-        <span className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />
-        <span className="text-lg font-semibold tabular-nums" style={{ color: theme.textPrimary }}>
-          {fmt(count)}
-        </span>
-        <span className="text-xs" style={{ color: theme.textSecondary }}>
-          {label}
-        </span>
+      <span className="h-2 w-2 rounded-full" style={{ backgroundColor: color }} />
+      <span className="text-lg font-semibold tabular-nums" style={{ color: theme.textPrimary }}>
+        {fmt(count)}
       </span>
-      <span className="pl-4 text-[11px] tabular-nums" style={{ color: theme.textMuted }}>
-        {fmt(units)} units
+      <span className="text-xs" style={{ color: theme.textSecondary }}>
+        {label}
       </span>
     </button>
   );
