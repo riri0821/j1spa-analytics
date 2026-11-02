@@ -6,7 +6,8 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "check:ledger": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/ledger.check.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

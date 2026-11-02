@@ -2,7 +2,10 @@
  * Builds the per-product stock ledger (stock card) shown on /ledger/[sku]:
  * opening balance, one row per stock movement, and the closing totals.
  * Read-only - everything here is derived from rows already written by
- * confirm_sale / undo_sale / edit_sale / record_stock_movements.
+ * confirm_sale / undo_sale / edit_sale / record_stock_movements, plus the
+ * opening row api/products/save writes for a new product.
+ *
+ * Checked by web/scripts/ledger.check.mjs (`npm run check:ledger`).
  */
 
 // The Philippines is UTC+8 all year (no DST since 1978), so a calendar date
@@ -69,6 +72,11 @@ export function describeMovement(movement) {
       // Stock-in references are free text typed on the Stock In screen.
       return reference ? `Replenished stock – ${reference}` : "Replenished stock";
     case "adjustment": {
+      // A product created on the Products screen with a non-zero opening
+      // stock gets one of these as its very first row (reference 'opening',
+      // note 'opening stock' - see api/products/save). It is the stock
+      // arriving, not a correction to something that came before it.
+      if (reference === "opening") return "Opening stock";
       const detail = note || reference;
       return detail ? `Stock correction – ${detail}` : "Stock correction";
     }
@@ -95,11 +103,22 @@ export function describeMovement(movement) {
 }
 
 /**
- * The balance the product started life with. New products are inserted with
- * their opening stock_on_hand directly and get no movement row for it (see
- * api/products/save), so it has to be read back out of the first movement:
- * the balance it landed on, minus the change it made. With no movements at
- * all, nothing has happened since, so current stock is the opening balance.
+ * The balance the product held before its first recorded movement. One
+ * formula covers the two ways a product can start out, because both leave
+ * the same trace in the first movement - the balance it landed on, minus
+ * the change it made:
+ *
+ *   - Created on the Products screen with opening stock: api/products/save
+ *     writes an 'adjustment' row (reference 'opening') carrying the whole
+ *     opening quantity, so this returns 0 - correct, because the product
+ *     really did start empty and that row is the stock arriving. It shows
+ *     up as the ledger's first IN line.
+ *   - Imported, or created with an opening stock of 0: stock_on_hand was
+ *     set directly and no movement row records it, so the figure is
+ *     recovered from whatever movement came first instead.
+ *
+ * With no movements at all, nothing has happened since the product was
+ * created, so its current stock is also its opening balance.
  */
 export function deriveOpeningBalance(product, movements) {
   const first = movements[0];
