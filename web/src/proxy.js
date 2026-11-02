@@ -33,11 +33,14 @@ export async function proxy(request) {
   // /auth/confirm verifies a password-reset link for a not-yet-signed-in
   // visitor, and /api/auth/forgot-password is the public form submission
   // that sends that link - both have to be reachable with no session.
+  // /api/cron/* is called by a scheduler, which has no session either; those
+  // routes authorize themselves against CRON_SECRET instead.
   const isPublicPath = [
     "/login",
     "/auth/confirm",
     "/api/auth/forgot-password",
     "/api/auth/login",
+    "/api/cron/",
   ].some((p) => request.nextUrl.pathname.startsWith(p));
 
   if (!user && !isPublicPath) {

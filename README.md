@@ -110,6 +110,47 @@ cp .env.example .env                # fill in Supabase service-role key + shared
 uvicorn main:app --reload
 ```
 
+### Keeping the forecast service warm
+
+Render's free tier spins the service down after ~15 minutes idle, and the next
+request waits 30–50s for it to boot. That cold start, not the statistics, is the
+biggest part of a slow "Run comparison" — the five-model fit itself is ~0.6s.
+
+The service's `/health` endpoint is unauthenticated by design
+(`forecast-service/main.py`), so anything that can make an HTTPS request can keep
+the instance up - no key, no secret, no repository variable.
+
+**The scheduler in use is pg_cron**, installed by
+`sql/supabase_add_forecast_warm_cron.sql`. It calls `net.http_get()` against the
+service's `/health` every 5 minutes from the Supabase database this project
+already runs, with no third-party account in the loop:
+
+```sql
+select cron.schedule('keep-forecast-warm', '*/5 * * * *',
+  $job$ select net.http_get('https://j1spa-dss.onrender.com/health') $job$);
+```
+
+Two other things also ping it:
+
+* `/forecasting` calls `/api/cron/warm-forecast` when the owner opens the page, so
+  the boot overlaps with them picking a SKU instead of with their first click.
+  That route hits `/health` too, and authorizes either an owner session or a
+  scheduler presenting `Authorization: Bearer $CRON_SECRET`.
+* `.github/workflows/keep-forecast-warm.yml` pings `/health` **directly**, not
+  through the Next.js route, on a `*/5` schedule. It is installed and works on
+  `workflow_dispatch`, but GitHub queues scheduled runs on a best-effort basis and
+  did not fire the schedule reliably - which is why pg_cron does the real work. It
+  needs no secret; override the target with a repository variable
+  `FORECAST_HEALTH_URL` only if the service moves.
+
+Not Vercel Cron: the Hobby plan runs cron jobs at most once a day, which cannot
+cover a 15-minute idle timeout.
+
+Budget note: Render's free tier allows 750 instance-hours a month and keeping one
+service always-on uses ~730 of them. Stop the ping when the service doesn't need to
+be responsive - `select cron.unschedule('keep-forecast-warm');`, and disable the
+GitHub workflow if it is enabled.
+
 ---
 
 ## 5. Database
