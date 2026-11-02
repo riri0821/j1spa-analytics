@@ -68,7 +68,7 @@ export default function TrackingTable({ rows }) {
   );
 
   return (
-    <Card title="Tracking" subtitle="Click a SKU to view its demand forecast" actions={paginationArrows}>
+    <Card title="Tracking" subtitle="Click a SKU to view its stock ledger" actions={paginationArrows}>
     <div className="flex flex-col gap-3">
       <div className="flex flex-wrap gap-2">
         <Select
@@ -110,7 +110,7 @@ export default function TrackingTable({ rows }) {
               return (
                 <tr key={r.sku} className="border-t" style={{ borderColor: theme.border }}>
                   <td className="px-3 py-2 font-mono">
-                    <a href={`/forecasting?sku=${encodeURIComponent(r.sku)}`} style={{ color: CATEGORICAL[0] }}>
+                    <a href={`/ledger/${encodeURIComponent(r.sku)}`} style={{ color: CATEGORICAL[0] }}>
                       {r.sku}
                     </a>
                   </td>

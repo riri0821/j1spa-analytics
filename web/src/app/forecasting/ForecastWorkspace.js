@@ -7,8 +7,11 @@ import { theme, CATEGORICAL, STATUS } from "../dashboard/theme";
 const MODELS = ["MA", "WMA", "Linear Regression", "ARIMA", "Holt-Winters"];
 const HORIZONS = [7, 14, 30, 60, 90];
 
-export default function ForecastWorkspace({ products }) {
-  const [skuInput, setSkuInput] = useState("");
+export default function ForecastWorkspace({ products, initialSku = "" }) {
+  // Pre-filled when the page is opened from a product's stock ledger
+  // (/forecasting?sku=...). The comparison still waits for the button; only
+  // the background prefetch below reacts to the SKU being set.
+  const [skuInput, setSkuInput] = useState(initialSku);
   const [horizon, setHorizon] = useState(30);
   const [selectedModels, setSelectedModels] = useState(new Set(MODELS));
   const [loading, setLoading] = useState(false);
