@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { theme } from "../dashboard/theme";
 import StockInTracker from "./StockInTracker";
-import CategoryProductPicker from "@/components/CategoryProductPicker";
+import CategoryProductPicker, { fetchActiveProducts } from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
@@ -49,14 +49,17 @@ export default function StockInScreen() {
   const [quickText, setQuickText] = useState("");
   const [quickLines, setQuickLines] = useState(null); // null = not parsed yet
 
+  // The whole active catalog, paged: quick entry resolves its lines against
+  // this list, and .limit(2000) could not actually return more than
+  // Supabase's 1000-row ceiling, so anything past the first 1000 products
+  // by name simply never matched.
   const loadCatalog = useCallback(async () => {
-    const { data } = await supabase
-      .from("products")
-      .select("product_id, sku, name, brand, supplier, stock_on_hand, reorder_point")
-      .eq("is_active", true)
-      .order("name")
-      .limit(2000);
-    setCatalog(data ?? []);
+    const { rows, error: failed } = await fetchActiveProducts(supabase, {
+      columns: "product_id, sku, name, brand, supplier, stock_on_hand, reorder_point",
+      searchFields: [],
+    });
+    if (failed) console.error("quick-entry catalog read failed:", failed);
+    setCatalog(rows);
   }, [supabase]);
 
   useEffect(() => {
@@ -244,9 +247,13 @@ export default function StockInScreen() {
                 setQuickLines(null);
               }}
               rows={4}
+              placeholder={"One item per line: quantity, then product name or SKU\n5 oil\n10 J1-0485\n3x brake pad"}
               className={inputClass}
               style={inputStyle}
             />
+            <p className="text-xs" style={{ color: theme.textMuted }}>
+              Quantity first, then name, SKU or brand.
+            </p>
             <div className="flex items-center gap-2">
               <button
                 onClick={parseQuickEntry}
