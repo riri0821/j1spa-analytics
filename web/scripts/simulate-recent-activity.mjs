@@ -1,33 +1,38 @@
 #!/usr/bin/env node
 /**
- * Fill the gap between the last seed sale and today with simulated parts
- * sales and services.
+ * Top up the database with simulated parts sales and services, from the last
+ * recorded event to now.
  *
  *   node scripts/simulate-recent-activity.mjs            # dry run (default)
  *   node scripts/simulate-recent-activity.mjs --apply    # actually write
  *
- * Parts sales are generated to match the seed data's own shape - sales per
- * weekday, lines per sale, quantities, which SKUs move, and who recorded
- * them - and each one has the same effect confirm_sale() would: a sales row,
- * sale_items rows, products.stock_on_hand decremented, and a sale_decrement
- * movement with the right balance_after. Stock is replenished when a product
- * reaches its reorder point, so the ledger shows deliveries as well as sales.
+ * Re-runnable: each run fills the gap between the latest sale/service and
+ * now, never writes a future timestamp, and appends its inserted id ranges
+ * to scripts/simulated-ids.json. Running it again the morning of a demo adds
+ * only the days since the last run.
+ *
+ * The point is that the seam is invisible. Volume, weekday shape, hour of
+ * day, lines per sale, quantities, which SKUs move and who recorded them all
+ * come from the seed data's own most recent 8 weeks, adjusted by the seed's
+ * own Oct-Nov vs Aug-Sep seasonality. Each simulated sale has the same effect
+ * confirm_sale() would: a sales row, sale_items rows, products.stock_on_hand
+ * decremented, and a sale_decrement movement with the right balance_after.
+ *
+ * Stock is ordered PROACTIVELY - when a product's projected stock would fall
+ * below its reorder point within the delivery lead time, the delivery is
+ * placed so it lands before the shelf empties. A stockout is the thing to
+ * avoid: it removes demand from the record, and the forecasting models would
+ * read the dip as real.
  *
  * Services are labour only. record_service() touches no stock, so neither
  * does this: no stock_movements, no stock_on_hand change.
  *
- * Tagging: sales.note = 'simulated' and stock_movements.note = 'simulated'.
- * The services table has no note column, so the inserted service_id range is
- * written to scripts/simulated-ids.json instead.
- *
  * MUST run after scripts/backfill-ledger.mjs --apply: that script anchors
  * every product's ledger on products.stock_on_hand, and this one changes
- * stock_on_hand. Running them the other way round would leave the backfill
- * reconstructing history against a stock level this script had already
- * moved.
+ * stock_on_hand.
  */
 
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
   createServiceClient,
@@ -38,7 +43,6 @@ import {
   progressLine,
   WEB_DIR,
 } from "./lib/db.mjs";
-import { stockCeiling } from "./lib/ledgerPlan.mjs";
 import {
   addDaysMs,
   deliveryReceipt,
@@ -48,14 +52,12 @@ import {
   manilaDateString,
   manilaMidnight,
   manilaParts,
+  manilaSameDayAt,
   manilaStamp,
   parseArgs,
   randInt,
-  randomStoreHour,
   section,
   seedFor,
-  STORE_CLOSE_HOUR,
-  STORE_OPEN_HOUR,
   table,
   toManilaIso,
   weightedIndex,
@@ -65,13 +67,36 @@ const SIMULATED_NOTE = "simulated";
 const BACKFILL_NOTE = "seed-backfill";
 const IDS_FILE = resolve(WEB_DIR, "scripts", "simulated-ids.json");
 
-// Services only exist from October 2026 - the feature launched then, so
-// there is nothing earlier to simulate.
+// Services launched in October 2026 - there is nothing earlier to simulate.
 const SERVICES_EPOCH = manilaMidnight("2026-10-06");
 
+// Sale ids at or above this were entered by hand through the app, not
+// seeded. They sit outside store hours (00:30-02:09 Manila) and must not be
+// allowed to shape the simulation's patterns.
+const REAL_APP_SALES_FROM = 156467;
+
+export const BASE_WEEKS = 8; // the window volume and mix are learned from
+export const LEAD_MIN_DAYS = 2;
+export const LEAD_MAX_DAYS = 5;
+export const BUFFER_MIN_DAYS = 3; // stock a delivery carries beyond the lead
+export const BUFFER_MAX_DAYS = 5;
+// Demand is lumpy - a product selling 0.3/day on average still takes a
+// 3-unit order now and then - so the reorder trigger looks further ahead
+// than the bare lead time. Without this the projection is right on average
+// and late in practice.
+export const SAFETY_DAYS = 2;
+
+// Deliveries arrive when the shop opens, not spread through the trading day
+// like sales. That is both how it works and what stops a delivery dated
+// 4 PM from leaving the morning's sales short of the stock that arrived.
+export const DELIVERY_HOUR_MIN = 8;
+export const DELIVERY_HOUR_MAX = 10;
+
 // total_amount is drawn inside the range and rounded to the nearest 10 pesos.
-// Weights favour the cheap, common jobs.
-const SERVICE_TYPES = [
+// Weights favour the cheap, common jobs. This list is closed: service types
+// already in the data that are not on it ("wash", "brake") are test rows and
+// are deliberately not reused.
+export const SERVICE_TYPES = [
   { type: "Change oil (labor)", min: 150, max: 300, weight: 10 },
   { type: "CVT cleaning", min: 300, max: 500, weight: 8 },
   { type: "Brake service", min: 200, max: 400, weight: 7 },
@@ -84,7 +109,8 @@ const SERVICE_TYPES = [
   { type: "Bearing replacement (labor)", min: 300, max: 600, weight: 2 },
 ];
 
-const BASE_BRANDS = [
+// Closed list as well - "tagpe" in the existing data is a test value.
+export const BRANDS = [
   { brand: "Yamaha", weight: 10 },
   { brand: "Honda", weight: 9 },
   { brand: "Suzuki", weight: 3 },
@@ -100,32 +126,21 @@ async function main() {
   section("Simulate recent activity" + (args.apply ? " -- APPLY" : " -- DRY RUN (no writes)"));
   console.log(`  PostgREST page size in use: ${fmtInt(pageSize)}`);
 
-  // ------------------------------------------------- precondition check
   const { count: backfilled, error: countError } = await sb
     .from("stock_movements")
     .select("*", { count: "exact", head: true })
     .eq("note", BACKFILL_NOTE);
   if (countError) throw new Error(`could not check for the backfill: ${countError.message}`);
-
   const backfillApplied = (backfilled ?? 0) > 0;
-  if (!backfillApplied) {
+
+  // --apply stops here. A dry run prints the whole plan first and only then
+  // exits 1, so the plan can be reviewed before the backfill is applied.
+  if (!backfillApplied && args.apply) {
     section("PRECONDITION NOT MET - the ledger backfill has not been applied");
-    console.log(
-      `  stock_movements holds 0 rows tagged '${BACKFILL_NOTE}'.\n\n` +
-        `  Run this first:\n` +
-        `      node scripts/backfill-ledger.mjs --apply\n\n` +
-        `  Order matters: backfill-ledger anchors every product's ledger on\n` +
-        `  products.stock_on_hand, and this script changes stock_on_hand. Run\n` +
-        `  them the other way round and the backfill would rebuild six years of\n` +
-        `  history against a stock level this script had already moved.`
-    );
-    if (args.apply) {
-      console.log(`\n  --apply REFUSED. Nothing was written.`);
-      process.exitCode = 1;
-      return;
-    }
-    console.log(`\n  Continuing the DRY RUN anyway (it writes nothing) so the plan can be`);
-    console.log(`  reviewed. --apply would refuse until the backfill is in place.`);
+    printPreconditionHelp();
+    console.log(`\n  --apply REFUSED. Nothing was written.`);
+    process.exitCode = 1;
+    return;
   }
 
   // ---------------------------------------------------------------- load
@@ -145,97 +160,130 @@ async function main() {
   const lastMovement = await latestTs(sb, "stock_movements", "movement_ts");
   const lastService = await latestTs(sb, "services", "service_ts");
 
-  // Start after the latest of the three. Starting merely after the last
-  // SALE would interleave simulated movements with the existing Oct 6
-  // movements, and then a product's balances would not chain.
+  // Start after the latest of the three: starting merely after the last SALE
+  // would interleave simulated movements with existing ones and break the
+  // per-product balance chain.
   const anchor = Math.max(lastSale ?? 0, lastMovement ?? 0, lastService ?? 0);
   const now = Date.now();
   const startTs = anchor + 60000;
-  const startDate = manilaDateString(startTs);
-  const endDate = manilaDateString(now);
 
   console.log(`  latest sale_ts      : ${lastSale ? manilaStamp(lastSale) : "-"}`);
   console.log(`  latest movement_ts  : ${lastMovement ? manilaStamp(lastMovement) : "-"}`);
   console.log(`  latest service_ts   : ${lastService ? manilaStamp(lastService) : "-"}`);
-  console.log(`  simulating          : ${startDate} .. ${endDate} (Manila)`);
+  console.log(`  simulating          : ${manilaStamp(startTs)} .. ${manilaStamp(now)} (Manila)`);
 
-  if (manilaMidnight(startDate) > manilaMidnight(endDate)) {
+  if (startTs > now) {
     section("Nothing to do");
-    console.log("  The data already reaches today.");
+    console.log("  The data already reaches now.");
     return;
   }
 
-  // ----------------------------------------------------- learn patterns
-  const yearAgo = addDaysMs(now, -365);
-  progressLine("loading the last 12 months of sales...");
-  const recentSales = await pageAll(
+  // -------------------------------------------- the 8-week learning base
+  progressLine("loading sales...");
+  const allSales = await pageAll(
     () =>
       sb
         .from("sales")
-        .select("sale_id, sale_ts, user_id, user_role, total_amount")
+        .select("sale_id, sale_ts, user_id, user_role, total_amount, total_cost, note")
         .eq("status", "confirmed")
-        .gte("sale_ts", new Date(yearAgo).toISOString())
         .order("sale_id"),
-    { pageSize, label: "recent sales" }
+    { pageSize, label: "sales" }
   );
-  progressDone(`sales in the last 12 months: ${fmtInt(recentSales.length)}`);
+  // The seed, excluding the by-hand app sales and anything a previous run of
+  // this script added.
+  const seedSales = allSales.filter((s) => s.sale_id < REAL_APP_SALES_FROM && s.note !== SIMULATED_NOTE);
+  progressDone(`seed sales: ${fmtInt(seedSales.length)} of ${fmtInt(allSales.length)} confirmed`);
 
-  const ninetyAgo = addDaysMs(now, -90);
-  const recentIds = new Set(recentSales.filter((s) => Date.parse(s.sale_ts) >= ninetyAgo).map((s) => s.sale_id));
+  let lastSeedTs = null;
+  for (const s of seedSales) {
+    const t = Date.parse(s.sale_ts);
+    if (lastSeedTs == null || t > lastSeedTs) lastSeedTs = t;
+  }
+  if (lastSeedTs == null) throw new Error("no seed sales found to learn from");
 
-  progressLine("loading the last 90 days of sale_items...");
-  const recentItems = await pageAll(
+  // The base window ends at the last seed sale, NOT today: anchoring it to
+  // today would average in the empty gap this script exists to fill and
+  // roughly halve the simulated volume.
+  const baseEnd = lastSeedTs;
+  const baseStart = addDaysMs(baseEnd, -BASE_WEEKS * 7);
+  const baseSales = seedSales.filter((s) => {
+    const t = Date.parse(s.sale_ts);
+    return t >= baseStart && t <= baseEnd;
+  });
+  if (baseSales.length === 0) throw new Error("the 8-week base window holds no sales");
+
+  const baseIds = new Set(baseSales.map((s) => s.sale_id));
+  const lo = baseSales[0].sale_id;
+  progressLine("loading the base window's sale_items...");
+  const baseItemsRaw = await pageAll(
     () =>
       sb
         .from("sale_items")
-        .select("sale_id, product_id, quantity")
-        .gte("sale_id", [...recentIds].reduce((lo, id) => (lo == null || id < lo ? id : lo), null) ?? 0)
+        .select("sale_id, product_id, quantity, unit_price, unit_cost")
+        .gte("sale_id", lo)
         .order("sale_item_id"),
-    { pageSize, label: "recent sale_items" }
+    { pageSize, label: "sale_items" }
   );
-  const items90 = recentItems.filter((i) => recentIds.has(i.sale_id));
-  progressDone(`sale_items in the last 90 days: ${fmtInt(items90.length)}`);
+  const baseItems = baseItemsRaw.filter((i) => baseIds.has(i.sale_id));
+  progressDone(`base-window sale lines: ${fmtInt(baseItems.length)}`);
 
-  const patterns = learnPatterns({ recentSales, items90, recentIds, now });
+  const patterns = learnPatterns({ seedSales, baseSales, baseItems, baseStart, baseEnd });
 
-  // Service types and vehicle brands already present in the data.
+  // --------------------------------------------------- test-data review
   const existingServices = await pageAll(
-    () => sb.from("services").select("service_id, service_type, customer_vehicle_brand, total_amount").order("service_id"),
-    { pageSize, label: "services" }
-  );
-  const brandRows = await pageAll(
     () =>
       sb
-        .from("sales")
-        .select("customer_vehicle_brand")
-        .not("customer_vehicle_brand", "is", null)
-        .gte("sale_ts", new Date(yearAgo).toISOString())
-        .order("sale_id"),
+        .from("services")
+        .select("service_id, service_ts, service_type, customer_vehicle_brand, total_amount")
+        .order("service_id"),
+    { pageSize, label: "services" }
+  );
+  const brandedSales = await pageAll(
+    () => sb.from("sales").select("sale_id, customer_vehicle_brand").not("customer_vehicle_brand", "is", null).order("sale_id"),
     { pageSize, label: "brands" }
   );
+  const allProducts = await pageAll(
+    () => sb.from("products").select("product_id, sku, name, is_active, stock_on_hand").order("product_id"),
+    { pageSize, label: "all products" }
+  );
 
-  const serviceTypes = mergeServiceTypes(existingServices);
-  const brands = mergeBrands(existingServices, brandRows);
+  printPatterns(patterns);
+  printTestData({ existingServices, brandedSales, allProducts, allSales });
 
-  printPatterns(patterns, serviceTypes, brands, existingServices);
+  // ------------------------------------------------------------ simulate
+  const plan = simulate({ products, patterns, startTs, now });
 
-  // --------------------------------------------------------- simulate
-  const plan = simulate({ products, patterns, serviceTypes, brands, startTs, now });
-
-  // ---------------------------------------------------------- reports
-  printPlan({ plan, products, startTs, now, existingServices });
+  printPlan({ plan, patterns, startTs, now, existingServices });
 
   if (!args.apply) {
     section("Dry run complete - nothing was written");
-    console.log("  Re-run with --apply to write these rows" + (backfillApplied ? "." : " (refused until the backfill is applied)."));
-    console.log(`  On --apply, the inserted id ranges are written to scripts/simulated-ids.json.`);
+    if (!backfillApplied) {
+      printPreconditionHelp();
+      console.log(`\n  Exiting 1: the plan above is valid, but --apply would refuse until the`);
+      console.log(`  backfill is in place.`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log("  Re-run with --apply to write these rows.");
+    console.log("  On --apply the inserted id ranges are appended to scripts/simulated-ids.json.");
     return;
   }
 
   await applyPlan(sb, plan);
 }
 
-// ---------------------------------------------------------------- helpers
+function printPreconditionHelp() {
+  section("PRECONDITION NOT MET - the ledger backfill has not been applied");
+  console.log(
+    `  stock_movements holds 0 rows tagged '${BACKFILL_NOTE}'.\n\n` +
+      `  Run this first:\n` +
+      `      node scripts/backfill-ledger.mjs --apply\n\n` +
+      `  Order matters: backfill-ledger anchors every product's ledger on\n` +
+      `  products.stock_on_hand, and this script changes stock_on_hand. Run them\n` +
+      `  the other way round and the backfill would rebuild six years of history\n` +
+      `  against a stock level this script had already moved.`
+  );
+}
 
 async function latestTs(sb, table_, column) {
   const { data, error } = await sb.from(table_).select(column).order(column, { ascending: false }).limit(1);
@@ -243,55 +291,100 @@ async function latestTs(sb, table_, column) {
   return data?.[0] ? Date.parse(data[0][column]) : null;
 }
 
-function learnPatterns({ recentSales, items90, recentIds, now }) {
-  // Sales per weekday: total sales on that weekday divided by how many of
-  // that weekday actually occurred in the window, so a partial year does
-  // not understate it.
+// ------------------------------------------------------------- patterns
+
+export function learnPatterns({ seedSales, baseSales, baseItems, baseStart, baseEnd }) {
   const perWeekday = Array.from({ length: 7 }, () => ({ sales: 0, days: new Set() }));
-  for (const s of recentSales) {
+  const hourHist = new Array(24).fill(0);
+  for (const s of baseSales) {
     const ts = Date.parse(s.sale_ts);
     const p = manilaParts(ts);
     perWeekday[p.weekday].sales += 1;
     perWeekday[p.weekday].days.add(manilaDateString(ts));
+    hourHist[p.hour] += 1;
   }
   const salesPerWeekday = perWeekday.map((w) => (w.days.size > 0 ? w.sales / w.days.size : 0));
 
-  // Lines per sale, and quantity per line, as histograms sampled directly
-  // rather than fitted - the real shape is what matters.
+  const baseDays = new Set(baseSales.map((s) => manilaDateString(Date.parse(s.sale_ts))));
+  const baseDailyAvg = baseDays.size > 0 ? baseSales.length / baseDays.size : 0;
+
   const linesBySale = new Map();
   const qtyHist = new Map();
-  for (const it of items90) {
+  const unitsByProduct = new Map();
+  let baseRevenue = 0;
+  let baseCost = 0;
+  for (const it of baseItems) {
     linesBySale.set(it.sale_id, (linesBySale.get(it.sale_id) ?? 0) + 1);
     qtyHist.set(it.quantity, (qtyHist.get(it.quantity) ?? 0) + 1);
+    unitsByProduct.set(it.product_id, (unitsByProduct.get(it.product_id) ?? 0) + it.quantity);
+    baseRevenue += Number(it.unit_price) * it.quantity;
+    baseCost += Number(it.unit_cost) * it.quantity;
   }
   const lineHist = new Map();
-  for (const id of recentIds) {
-    const n = linesBySale.get(id) ?? 0;
-    if (n > 0) lineHist.set(n, (lineHist.get(n) ?? 0) + 1);
-  }
+  for (const n of linesBySale.values()) lineHist.set(n, (lineHist.get(n) ?? 0) + 1);
 
-  // Which SKUs move, weighted by units sold in the last 90 days.
-  const unitsByProduct = new Map();
-  for (const it of items90) {
-    unitsByProduct.set(it.product_id, (unitsByProduct.get(it.product_id) ?? 0) + it.quantity);
-  }
-
-  // Who recorded them, in the same proportions.
   const userHist = new Map();
-  for (const s of recentSales) {
-    if (Date.parse(s.sale_ts) < addDaysMs(now, -90)) continue;
+  for (const s of baseSales) {
     const key = `${s.user_id ?? ""}|${s.user_role}`;
     userHist.set(key, (userHist.get(key) ?? 0) + 1);
   }
 
+  // Daily demand per product over the base window - what proactive ordering
+  // projects against.
+  const baseSpanDays = Math.max(1, Math.round((baseEnd - baseStart) / 86400000));
+  const dailyDemand = new Map();
+  for (const [productId, units] of unitsByProduct) dailyDemand.set(productId, units / baseSpanDays);
+
+  // Seasonality from the seed's own history: Oct-Nov against Aug-Sep, per
+  // year. The early years are dominated by the shop's growth rather than the
+  // season, so only the most recent complete years are averaged.
+  const perDay = new Map();
+  for (const s of seedSales) {
+    const d = manilaDateString(Date.parse(s.sale_ts));
+    perDay.set(d, (perDay.get(d) ?? 0) + 1);
+  }
+  const years = new Set();
+  for (const d of perDay.keys()) years.add(Number(d.slice(0, 4)));
+  const seasonRows = [];
+  for (const y of [...years].sort()) {
+    const rate = (months) => {
+      let n = 0;
+      let days = 0;
+      for (const [d, c] of perDay) {
+        const [yy, mm] = d.split("-").map(Number);
+        if (yy === y && months.includes(mm)) {
+          n += c;
+          days += 1;
+        }
+      }
+      return days >= 40 ? n / days : null; // need most of both months
+    };
+    const augSep = rate([8, 9]);
+    const octNov = rate([10, 11]);
+    if (augSep && octNov) seasonRows.push({ year: y, augSep, octNov, ratio: octNov / augSep });
+  }
+  const recent = seasonRows.slice(-3);
+  const seasonality = recent.length ? recent.reduce((a, r) => a + r.ratio, 0) / recent.length : 1;
+
   return {
     salesPerWeekday,
+    hourHist,
     lineHist: toWeighted(lineHist),
     qtyHist: toWeighted(qtyHist),
     unitsByProduct,
+    dailyDemand,
     users: toWeighted(userHist),
-    sampleSize: recentSales.length,
-    items90: items90.length,
+    baseDailyAvg,
+    baseDays: baseDays.size,
+    baseSales: baseSales.length,
+    baseItems: baseItems.length,
+    baseStart,
+    baseEnd,
+    baseMargin: baseRevenue > 0 ? ((baseRevenue - baseCost) / baseRevenue) * 100 : 0,
+    baseRevenue,
+    seasonality,
+    seasonRows,
+    seasonYears: recent.map((r) => r.year),
   };
 }
 
@@ -305,56 +398,86 @@ function pickWeighted(dist, rand, fallback) {
   return dist.keys[weightedIndex(dist.weights, rand)];
 }
 
-function mergeServiceTypes(existingServices) {
-  const list = SERVICE_TYPES.map((t) => ({ ...t }));
-  for (const s of existingServices) {
-    const name = (s.service_type ?? "").trim();
-    if (!name || list.some((t) => t.type.toLowerCase() === name.toLowerCase())) continue;
-    // A type already in the data that is not on the agreed list: keep it,
-    // priced around what it was actually charged at.
-    const amount = Number(s.total_amount) || 200;
-    list.push({ type: name, min: Math.max(50, Math.round(amount * 0.8)), max: Math.round(amount * 1.2), weight: 2 });
-  }
-  return list;
+/** A time of day drawn from the seed's own Manila hour distribution. */
+export function seedHourTs(dayMs, hourHist, rand) {
+  const hour = weightedIndex(hourHist, rand);
+  return manilaSameDayAt(dayMs, hour, Math.floor(rand() * 60), Math.floor(rand() * 60));
 }
 
-function mergeBrands(existingServices, brandRows) {
-  const list = BASE_BRANDS.map((b) => ({ ...b }));
-  const seen = new Set(list.map((b) => b.brand.toLowerCase()));
-  for (const row of [...existingServices, ...brandRows]) {
-    const brand = (row.customer_vehicle_brand ?? "").trim();
-    if (!brand || seen.has(brand.toLowerCase())) continue;
-    seen.add(brand.toLowerCase());
-    list.push({ brand, weight: 2 });
-  }
-  return list;
+/**
+ * Should a delivery be ordered today, and how big?
+ *
+ * Proactive: the question is not "is stock low now" but "will it be below
+ * the reorder point by the time a delivery could arrive". Sizing from the
+ * product's own demand rate rather than topping up to a fixed ceiling is
+ * what keeps total stock near where it started - a ceiling with a floor of
+ * ten units would roughly double a catalog whose average product holds six.
+ */
+export function planDelivery({
+  have,
+  dailyDemand,
+  reorderPoint,
+  lead,
+  buffer,
+  safetyDays = SAFETY_DAYS,
+  maxLineQty = 1,
+}) {
+  if (dailyDemand <= 0) return null;
+
+  // The trigger is deliberately conservative in two ways the mean demand
+  // alone does not capture. It assumes the SLOWEST lead time, because the
+  // actual one is not known when the order goes in; and it keeps at least
+  // one largest-possible sale line in hand on top, because demand arrives
+  // in lumps of 1-3 units, not in smooth fractions. Triggering on the mean
+  // is right on average and late in practice - that was most of the
+  // residual stockouts.
+  const cover = dailyDemand * (LEAD_MAX_DAYS + safetyDays);
+  const threshold = reorderPoint + Math.max(cover, maxLineQty);
+  if (have > threshold) return null;
+
+  // Order small and often rather than in bulk: the trigger above is what
+  // prevents the stockout, so the delivery only has to carry the shop to
+  // the next one. A big buffer here would just park inventory.
+  let qty = Math.max(1, Math.round(dailyDemand * (lead + buffer)));
+  const floorQty = Math.ceil(threshold + 1 - have);
+  if (floorQty > qty) qty = floorQty;
+  return { qty, threshold };
 }
 
-// ------------------------------------------------------------- simulation
+// ----------------------------------------------------------- simulation
 
-function simulate({ products, patterns, serviceTypes, brands, startTs, now }) {
+export function simulate({ products, patterns, startTs, now }) {
   const byId = new Map(products.map((p) => [p.product_id, p]));
   const balance = new Map(products.map((p) => [p.product_id, p.stock_on_hand]));
   const openingTotal = products.reduce((s, p) => s + p.stock_on_hand, 0);
+  const openingLowStock = products.filter((p) => p.stock_on_hand <= (p.reorder_point ?? 0)).length;
 
-  // Sellable SKUs, weighted by recent demand.
-  const sellable = products.filter((p) => (patterns.unitsByProduct.get(p.product_id) ?? 0) > 0);
+  const sellable = products.filter((p) => (patterns.dailyDemand.get(p.product_id) ?? 0) > 0);
   const weights = sellable.map((p) => patterns.unitsByProduct.get(p.product_id));
-
-  const ceilingFor = new Map();
-  for (const p of products) {
-    const monthly = ((patterns.unitsByProduct.get(p.product_id) ?? 0) / 90) * 30;
-    ceilingFor.set(p.product_id, stockCeiling(p, monthly));
-  }
+  // The largest quantity a single sale line ever asks for, from the seed's
+  // own histogram - the lumpiness the reorder trigger has to absorb.
+  const maxLineQty = patterns.qtyHist.keys.length ? Math.max(...patterns.qtyHist.keys) : 1;
 
   const sales = [];
   const movements = [];
   const services = [];
-  const restocksPending = new Map(); // dateString -> [{ productId, qty }]
+  const pendingArrival = new Set(); // products with a delivery already on order
+  const arrivals = new Map(); // dateString -> [{ productId, qty }]
   const shortfalls = new Map();
+  const shortByDay = new Map();
+  // Three different outcomes, deliberately counted apart:
+  //   trimmed      - the line happened but for fewer units than wanted
+  //   lost         - the sale ended with fewer lines than it meant to have
+  //   substituted  - an out-of-stock SKU was passed over and another taken,
+  //                  so the line and its units survive on a different SKU
+  // Only trimmed and lost remove demand from the record; a substitution
+  // moves it. Counting substitutions as lost lines overstated the damage.
+  let trimmedLines = 0;
+  let lostLines = 0;
+  let substitutions = 0;
   let restockCount = 0;
 
-  const rand = makeRand(seedFor("simulate", 1));
+  const rand = makeRand(seedFor("simulate", 3));
 
   const firstDay = manilaMidnight(manilaDateString(startTs));
   const lastDay = manilaMidnight(manilaDateString(now));
@@ -362,32 +485,69 @@ function simulate({ products, patterns, serviceTypes, brands, startTs, now }) {
   for (let day = firstDay; day <= lastDay; day = addDaysMs(day, 1)) {
     const dateKey = manilaDateString(day);
     const weekday = manilaParts(day).weekday;
+
+    // --------------------------------------------- proactive ordering
+    const openingWave = day === firstDay;
+    for (const product of sellable) {
+      if (pendingArrival.has(product.product_id)) continue;
+      // 133 products stand at zero stock at the seam. Making them wait a
+      // full lead time would open the window with a wave of stockouts that
+      // never happened - in reality the shop already has those orders in
+      // flight. The first day's deliveries therefore land in 1-2 days.
+      const lead = openingWave
+        ? randInt(rand, 1, 2)
+        : randInt(rand, LEAD_MIN_DAYS, LEAD_MAX_DAYS);
+      const order = planDelivery({
+        have: balance.get(product.product_id) ?? 0,
+        dailyDemand: patterns.dailyDemand.get(product.product_id) ?? 0,
+        reorderPoint: product.reorder_point ?? 0,
+        lead,
+        buffer: randInt(rand, BUFFER_MIN_DAYS, BUFFER_MAX_DAYS),
+        maxLineQty,
+      });
+      if (!order) continue;
+
+      // Clamped to the last day rather than dropped. Refusing to deliver in
+      // the final few days produced a cliff of stockouts right at "now" that
+      // was an artifact of the window ending, not of the shop running dry.
+      const arrivalDay = Math.min(addDaysMs(day, lead), lastDay);
+      const key = manilaDateString(arrivalDay);
+      if (!arrivals.has(key)) arrivals.set(key, []);
+      arrivals.get(key).push({ productId: product.product_id, qty: order.qty, opening: openingWave });
+      pendingArrival.add(product.product_id);
+    }
+
     const dayEvents = [];
 
-    // Deliveries that fall due today.
-    for (const due of restocksPending.get(dateKey) ?? []) {
-      dayEvents.push({ type: "restock", ts: randomStoreHour(day, rand), ...due });
+    for (const due of arrivals.get(dateKey) ?? []) {
+      // The opening wave lands exactly at opening time, ahead of that day's
+      // first sale: those products start the window empty, and letting a
+      // 10 AM delivery trail the 8 AM sales would invent a stockout.
+      const ts = due.opening
+        ? manilaSameDayAt(day, DELIVERY_HOUR_MIN, 0, 0)
+        : manilaSameDayAt(day, randInt(rand, DELIVERY_HOUR_MIN, DELIVERY_HOUR_MAX), Math.floor(rand() * 60), 0);
+      dayEvents.push({ type: "restock", ts, ...due });
+      pendingArrival.delete(due.productId);
     }
-    restocksPending.delete(dateKey);
+    arrivals.delete(dateKey);
 
-    // Today's sales, at the rate this weekday actually runs at.
-    const mean = patterns.salesPerWeekday[weekday] ?? 0;
-    const count = Math.max(0, Math.round(mean * (0.75 + 0.5 * rand())));
+    // Volume: the base window's rate for this weekday, nudged by the seed's
+    // own Oct-Nov seasonality, with a little day-to-day noise.
+    const mean = (patterns.salesPerWeekday[weekday] ?? 0) * patterns.seasonality;
+    const count = Math.max(0, Math.round(mean * (0.9 + 0.2 * rand())));
     for (let i = 0; i < count; i++) {
-      dayEvents.push({ type: "sale", ts: randomStoreHour(day, rand) });
+      dayEvents.push({ type: "sale", ts: seedHourTs(day, patterns.hourHist, rand) });
     }
 
-    // Today's services: 4-8 on an open day, fewer on Sundays. Only from the
-    // October 2026 launch onwards.
     if (day >= SERVICES_EPOCH) {
       const serviceCount = weekday === 0 ? randInt(rand, 1, 3) : randInt(rand, 4, 8);
       for (let i = 0; i < serviceCount; i++) {
-        dayEvents.push({ type: "service", ts: randomStoreHour(day, rand) });
+        dayEvents.push({ type: "service", ts: seedHourTs(day, patterns.hourHist, rand) });
       }
     }
 
-    // In time order, so each product's balances chain the way the ledger
-    // will read them.
+    // Time order, so every product's balances chain the way the ledger reads
+    // them. Anything outside the window is dropped - never a future row.
     dayEvents.sort((a, b) => a.ts - b.ts);
 
     for (const ev of dayEvents) {
@@ -416,10 +576,9 @@ function simulate({ products, patterns, serviceTypes, brands, startTs, now }) {
       }
 
       if (ev.type === "service") {
-        const pick = serviceTypes[weightedIndex(serviceTypes.map((t) => t.weight), rand)];
-        const raw = pick.min + rand() * (pick.max - pick.min);
-        const amount = Math.max(10, Math.round(raw / 10) * 10); // nearest 10 pesos
-        const brand = brands[weightedIndex(brands.map((b) => b.weight), rand)].brand;
+        const pick = SERVICE_TYPES[weightedIndex(SERVICE_TYPES.map((t) => t.weight), rand)];
+        const amount = Math.max(10, Math.round((pick.min + rand() * (pick.max - pick.min)) / 10) * 10);
+        const brand = BRANDS[weightedIndex(BRANDS.map((b) => b.weight), rand)].brand;
         const [userId, userRole] = splitUser(pickWeighted(patterns.users, rand, "|staff"));
         services.push({
           service_ts: toManilaIso(ev.ts),
@@ -428,7 +587,7 @@ function simulate({ products, patterns, serviceTypes, brands, startTs, now }) {
           service_type: pick.type,
           total_amount: amount,
           status: "confirmed",
-          // No invented personal data: only the vehicle brand is set.
+          // No invented personal data - only the vehicle brand is set.
           customer_name: null,
           customer_contact: null,
           customer_address: null,
@@ -438,29 +597,36 @@ function simulate({ products, patterns, serviceTypes, brands, startTs, now }) {
         continue;
       }
 
-      // ------------------------------------------------------- a sale
+      // ---------------------------------------------------------- sale
       const nLines = Math.min(6, Math.max(1, pickWeighted(patterns.lineHist, rand, 1)));
       const chosen = new Set();
       const lines = [];
       let revenue = 0;
       let cost = 0;
 
-      for (let attempt = 0; attempt < nLines * 4 && lines.length < nLines; attempt++) {
+      for (let attempt = 0; attempt < nLines * 5 && lines.length < nLines; attempt++) {
         if (sellable.length === 0) break;
         const product = sellable[weightedIndex(weights, rand)];
         if (chosen.has(product.product_id)) continue;
 
         const have = balance.get(product.product_id) ?? 0;
         if (have <= 0) {
-          scheduleRestock({ product, balance, ceilingFor, restocksPending, ts: ev.ts, rand });
+          // Out of stock: the line cannot happen. Counted, and another SKU
+          // is tried so the sale itself still goes through.
           bump(shortfalls, product.sku);
+          bump(shortByDay, dateKey);
+          substitutions += 1;
           continue;
         }
         chosen.add(product.product_id);
 
         const wanted = Math.max(1, pickWeighted(patterns.qtyHist, rand, 1));
-        const qty = Math.min(wanted, have); // never sell more than is on hand
-        if (qty < wanted) bump(shortfalls, product.sku);
+        const qty = Math.min(wanted, have);
+        if (qty < wanted) {
+          bump(shortfalls, product.sku);
+          bump(shortByDay, dateKey);
+          trimmedLines += 1;
+        }
 
         const next = have - qty;
         balance.set(product.product_id, next);
@@ -482,12 +648,9 @@ function simulate({ products, patterns, serviceTypes, brands, startTs, now }) {
           line_cost: lineCost,
           __balanceAfter: next,
         });
-
-        if (next <= (product.reorder_point ?? 0)) {
-          scheduleRestock({ product, balance, ceilingFor, restocksPending, ts: ev.ts, rand });
-        }
       }
 
+      lostLines += Math.max(0, nLines - lines.length);
       if (lines.length === 0) continue;
 
       const [userId, userRole] = splitUser(pickWeighted(patterns.users, rand, "|staff"));
@@ -508,21 +671,26 @@ function simulate({ products, patterns, serviceTypes, brands, startTs, now }) {
     }
   }
 
-  // Restocks scheduled past the end of the window simply never arrive.
-  let unfilled = 0;
-  for (const list of restocksPending.values()) unfilled += list.length;
-
   const closingTotal = [...balance.values()].reduce((s, v) => s + v, 0);
+  const closingLowStock = products.filter((p) => (balance.get(p.product_id) ?? 0) <= (p.reorder_point ?? 0)).length;
+  const saleLines = sales.reduce((n, s) => n + s.lines.length, 0);
 
   return {
     sales,
     movements,
     services,
     restockCount,
-    unfilled,
     shortfalls,
+    shortByDay,
+    trimmedLines,
+    lostLines,
+    substitutions,
+    saleLines,
     openingTotal,
     closingTotal,
+    openingLowStock,
+    closingLowStock,
+    productCount: products.length,
     balance,
     byId,
     unitsSold: sales.reduce((s, x) => s + x.lines.reduce((t, l) => t + l.quantity, 0), 0),
@@ -530,20 +698,8 @@ function simulate({ products, patterns, serviceTypes, brands, startTs, now }) {
     salesRevenue: sales.reduce((s, x) => round2(s + x.sale.total_amount), 0),
     salesCost: sales.reduce((s, x) => round2(s + x.sale.total_cost), 0),
     servicesRevenue: services.reduce((s, x) => round2(s + x.total_amount), 0),
+    days: new Set(sales.map((s) => manilaDateString(s.__ts))).size,
   };
-}
-
-function scheduleRestock({ product, balance, ceilingFor, restocksPending, ts, rand }) {
-  const when = manilaDateString(addDaysMs(ts, randInt(rand, 2, 5)));
-  const queued = restocksPending.get(when) ?? [];
-  // One pending delivery per product at a time, as a real order would be.
-  for (const list of restocksPending.values()) {
-    if (list.some((r) => r.productId === product.product_id)) return;
-  }
-  const ceiling = ceilingFor.get(product.product_id) ?? 10;
-  const qty = Math.max(1, ceiling - (balance.get(product.product_id) ?? 0));
-  queued.push({ productId: product.product_id, qty });
-  restocksPending.set(when, queued);
 }
 
 function splitUser(key) {
@@ -559,70 +715,142 @@ function round2(n) {
   return Math.round(n * 100) / 100;
 }
 
-// ----------------------------------------------------------------- output
+// --------------------------------------------------------------- output
 
-function printPatterns(patterns, serviceTypes, brands, existingServices) {
+function printPatterns(p) {
   const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-  section("Patterns learned from the seed data");
-  console.log(`  Sales sampled: ${fmtInt(patterns.sampleSize)} over the last 12 months`);
-  console.log(`  Sale lines sampled: ${fmtInt(patterns.items90)} over the last 90 days\n`);
+  section(`Patterns learned from the seed's last ${BASE_WEEKS} weeks`);
+  console.log(
+    `  Base window : ${manilaDateString(p.baseStart)} .. ${manilaDateString(p.baseEnd)}` +
+      ` (ends at the last seed sale, not today)\n` +
+      `  Sales       : ${fmtInt(p.baseSales)} over ${fmtInt(p.baseDays)} trading days = ${p.baseDailyAvg.toFixed(1)}/day\n` +
+      `  Sale lines  : ${fmtInt(p.baseItems)}\n` +
+      `  Gross margin: ${p.baseMargin.toFixed(2)}% (from the base window's own sale_items prices)`
+  );
+
+  console.log("\n  Sales per weekday:");
   table(
-    patterns.salesPerWeekday.map((v, i) => ({ d: DAYS[i], v })),
+    p.salesPerWeekday.map((v, i) => ({ d: DAYS[i], v, adj: v * p.seasonality })),
     [
       { label: "Weekday", get: (r) => r.d },
-      { label: "Sales per day", right: true, get: (r) => r.v.toFixed(1) },
+      { label: "Seed /day", right: true, get: (r) => r.v.toFixed(1) },
+      { label: "x seasonality", right: true, get: (r) => r.adj.toFixed(1) },
     ]
   );
+
+  console.log(`\n  Seasonality (Oct-Nov vs Aug-Sep, from the seed's own history):`);
+  table(p.seasonRows, [
+    { label: "Year", get: (r) => r.year },
+    { label: "Aug-Sep /day", right: true, get: (r) => r.augSep.toFixed(1) },
+    { label: "Oct-Nov /day", right: true, get: (r) => r.octNov.toFixed(1) },
+    { label: "Ratio", right: true, get: (r) => r.ratio.toFixed(3) },
+  ]);
+  console.log(
+    `  Factor applied: ${p.seasonality.toFixed(3)} (mean of ${p.seasonYears.join(", ")}; earlier\n` +
+      `  years are dominated by the shop's growth rather than the season)`
+  );
+
+  console.log("\n  Hour of day (Manila) the simulation draws from:");
+  const total = p.hourHist.reduce((a, b) => a + b, 0) || 1;
+  let max = 0;
+  for (const v of p.hourHist) if (v > max) max = v;
+  for (let h = 0; h < 24; h++) {
+    if (p.hourHist[h] === 0) continue;
+    console.log(
+      `    ${String(h).padStart(2, "0")}:00  ${String(p.hourHist[h]).padStart(5)}  ` +
+        `${((p.hourHist[h] / total) * 100).toFixed(1).padStart(5)}%  ${"#".repeat(Math.round((p.hourHist[h] / max) * 30))}`
+    );
+  }
+
   console.log("\n  Lines per sale:");
   table(
-    patterns.lineHist.keys
-      .map((k, i) => ({ k, w: patterns.lineHist.weights[i] }))
-      .sort((a, b) => a.k - b.k),
+    p.lineHist.keys.map((k, i) => ({ k, w: p.lineHist.weights[i] })).sort((a, b) => a.k - b.k),
     [
       { label: "Lines", right: true, get: (r) => r.k },
       { label: "Sales", right: true, get: (r) => fmtInt(r.w) },
     ]
   );
-  console.log("\n  Quantity per line (top 8):");
+  console.log(`\n  SKUs with demand in the base window: ${fmtInt(p.unitsByProduct.size)}`);
+  console.log("  Recorder mix (simulated rows use the same proportions):");
   table(
-    patterns.qtyHist.keys
-      .map((k, i) => ({ k, w: patterns.qtyHist.weights[i] }))
-      .sort((a, b) => b.w - a.w)
-      .slice(0, 8),
-    [
-      { label: "Qty", right: true, get: (r) => r.k },
-      { label: "Lines", right: true, get: (r) => fmtInt(r.w) },
-    ]
-  );
-  console.log(`\n  SKUs with demand in the last 90 days: ${fmtInt(patterns.unitsByProduct.size)}`);
-  console.log("\n  Who recorded the sale (simulated rows use these same proportions):");
-  table(
-    patterns.users.keys.map((k, i) => ({ k, w: patterns.users.weights[i] })).sort((a, b) => b.w - a.w),
+    p.users.keys.map((k, i) => ({ k, w: p.users.weights[i] })).sort((a, b) => b.w - a.w),
     [
       { label: "user_id|role", get: (r) => r.k.replace(/^([0-9a-f]{8})[^|]*/, "$1...") },
       { label: "Sales", right: true, get: (r) => fmtInt(r.w) },
     ]
   );
-  console.log(`\n  Service types in use: ${fmtInt(serviceTypes.length)} (${SERVICE_TYPES.length} from the agreed list)`);
-  const extra = serviceTypes.slice(SERVICE_TYPES.length).map((t) => t.type);
-  console.log(
-    `  Existing services rows: ${fmtInt(existingServices.length)}` +
-      (existingServices.length ? ` -> ${existingServices.map((s) => s.service_type).join(", ")}` : "")
+}
+
+function printTestData({ existingServices, brandedSales, allProducts, allSales }) {
+  section("Existing rows that look like test data (reported only - nothing is changed)");
+  const approvedTypes = new Set(SERVICE_TYPES.map((t) => t.type.toLowerCase()));
+  const approvedBrands = new Set(BRANDS.map((b) => b.brand.toLowerCase()));
+
+  const rows = [];
+  for (const p of allProducts) {
+    if (!/^J1-\d{4}$/i.test(p.sku)) {
+      rows.push({
+        what: "products",
+        id: `product_id ${p.product_id}`,
+        detail: `SKU "${p.sku}" (${p.name}) - not the J1-#### pattern; is_active=${p.is_active}, stock ${p.stock_on_hand}`,
+      });
+    }
+  }
+  for (const s of existingServices) {
+    if (!approvedTypes.has((s.service_type ?? "").toLowerCase())) {
+      rows.push({
+        what: "services",
+        id: `service_id ${s.service_id}`,
+        detail: `service_type "${s.service_type}" at ${fmtPeso(s.total_amount)} - not on the agreed list`,
+      });
+    }
+    if (s.customer_vehicle_brand && !approvedBrands.has(s.customer_vehicle_brand.toLowerCase())) {
+      rows.push({
+        what: "services",
+        id: `service_id ${s.service_id}`,
+        detail: `customer_vehicle_brand "${s.customer_vehicle_brand}" - not a real vehicle brand`,
+      });
+    }
+  }
+  const badBrandSales = brandedSales.filter(
+    (s) => s.customer_vehicle_brand && !approvedBrands.has(s.customer_vehicle_brand.toLowerCase())
   );
-  if (extra.length) console.log(`  Added from existing data: ${extra.join(", ")}`);
-  const added = brands.slice(BASE_BRANDS.length).map((b) => b.brand);
-  console.log(`  Vehicle brands: ${brands.map((b) => b.brand).join(", ")}`);
-  if (added.length) {
+  for (const s of badBrandSales.slice(0, 10)) {
+    rows.push({
+      what: "sales",
+      id: `sale_id ${s.sale_id}`,
+      detail: `customer_vehicle_brand "${s.customer_vehicle_brand}" - not a real vehicle brand`,
+    });
+  }
+  const handMade = allSales.filter((s) => s.sale_id >= REAL_APP_SALES_FROM && s.note !== SIMULATED_NOTE);
+  if (handMade.length) {
+    rows.push({
+      what: "sales",
+      id: `sale_id ${handMade[0].sale_id}..${handMade.at(-1).sale_id}`,
+      detail: `${handMade.length} sales entered by hand through the app, outside store hours - excluded from the patterns above`,
+    });
+  }
+
+  if (rows.length === 0) {
+    console.log("  None found.");
+  } else {
+    table(rows, [
+      { label: "Table", get: (r) => r.what },
+      { label: "Row", get: (r) => r.id },
+      { label: "Why it looks like test data", get: (r) => r.detail },
+    ]);
+    if (badBrandSales.length > 10) {
+      console.log(`  ... and ${fmtInt(badBrandSales.length - 10)} more sales with an unrecognised brand`);
+    }
     console.log(
-      `  ${added.length} brand(s) came from existing rows rather than the agreed list:` +
-        ` ${added.join(", ")}.\n  They keep the lowest weight. Edit BASE_BRANDS / mergeBrands to drop any that` +
-        `\n  are test data rather than real vehicle brands.`
+      `\n  None of these are reused by the simulation: brands come from a closed list\n` +
+        `  (${BRANDS.map((b) => b.brand).join(", ")}) and service types from the agreed list only.\n` +
+        `  Nothing here is changed or deleted - they are yours to clean up or keep.`
     );
   }
 }
 
-function printPlan({ plan, products, startTs, now, existingServices }) {
-  const saleItemCount = plan.sales.reduce((s, x) => s + x.lines.length, 0);
+function printPlan({ plan, patterns, startTs, now, existingServices }) {
   const touched = new Set();
   for (const s of plan.sales) for (const l of s.lines) touched.add(l.product_id);
   for (const m of plan.movements) touched.add(m.product_id);
@@ -631,11 +859,11 @@ function printPlan({ plan, products, startTs, now, existingServices }) {
   table(
     [
       { t: "sales (insert)", n: plan.sales.length },
-      { t: "sale_items (insert)", n: saleItemCount },
+      { t: "sale_items (insert)", n: plan.saleLines },
       { t: "services (insert)", n: plan.services.length },
-      { t: "stock_movements (insert) - sale_decrement", n: saleItemCount },
-      { t: "stock_movements (insert) - stock_in restocks", n: plan.movements.length },
-      { t: "stock_movements (insert) - TOTAL", n: saleItemCount + plan.movements.length },
+      { t: "stock_movements (insert) - sale_decrement", n: plan.saleLines },
+      { t: "stock_movements (insert) - stock_in deliveries", n: plan.movements.length },
+      { t: "stock_movements (insert) - TOTAL", n: plan.saleLines + plan.movements.length },
       { t: "products (update stock_on_hand)", n: touched.size },
     ],
     [
@@ -644,17 +872,93 @@ function printPlan({ plan, products, startTs, now, existingServices }) {
     ]
   );
   console.log(`\n  Date range covered: ${manilaStamp(startTs)}  ->  ${manilaStamp(now)} (Manila)`);
-  console.log(`  Synthetic restocks: ${fmtInt(plan.restockCount)}` + (plan.unfilled ? ` (${fmtInt(plan.unfilled)} scheduled past the window, not inserted)` : ""));
+  console.log(`  Simulated deliveries: ${fmtInt(plan.restockCount)}`);
+  console.log(
+    `  Substitutions: ${fmtInt(plan.substitutions)} - an out-of-stock SKU was passed over and
+` +
+      `  another taken, so the line and its units survive on a different SKU. Not
+` +
+      `  counted as a stockout, but it does move demand between SKUs.`
+  );
   console.log(`  Services are labour only: no stock_movements, no stock change.`);
+
+  // ------------------------------------------------------------ goals
+  section("Goals");
+  const simDaily = plan.days > 0 ? plan.sales.length / plan.days : 0;
+  const dailyGap = patterns.baseDailyAvg > 0 ? ((simDaily - patterns.baseDailyAvg) / patterns.baseDailyAvg) * 100 : 0;
+  const intended = plan.saleLines + plan.lostLines;
+  const stockoutRate = intended > 0 ? ((plan.trimmedLines + plan.lostLines) / intended) * 100 : 0;
+  const stockGap = plan.openingTotal > 0 ? ((plan.closingTotal - plan.openingTotal) / plan.openingTotal) * 100 : 0;
+  const openShare = (plan.openingLowStock / plan.productCount) * 100;
+  const closeShare = (plan.closingLowStock / plan.productCount) * 100;
+  const simMargin = plan.salesRevenue > 0 ? ((plan.salesRevenue - plan.salesCost) / plan.salesRevenue) * 100 : 0;
+  const marginGap = simMargin - patterns.baseMargin;
+
+  const goals = [
+    {
+      g: "Daily sales within ~10% of the seed's last 8 weeks",
+      got: `${simDaily.toFixed(1)}/day vs ${patterns.baseDailyAvg.toFixed(1)}/day (${dailyGap >= 0 ? "+" : ""}${dailyGap.toFixed(1)}%)`,
+      ok: Math.abs(dailyGap) <= 10,
+    },
+    {
+      g: "Stockout-trimmed or lost lines below 2%",
+      got: `${stockoutRate.toFixed(2)}% (${fmtInt(plan.trimmedLines)} trimmed + ${fmtInt(plan.lostLines)} lost of ${fmtInt(intended)} intended)`,
+      ok: stockoutRate < 2,
+    },
+    {
+      g: "Ending total units within +/-10% of today",
+      got: `${fmtInt(plan.closingTotal)} vs ${fmtInt(plan.openingTotal)} (${stockGap >= 0 ? "+" : ""}${stockGap.toFixed(1)}%)`,
+      ok: Math.abs(stockGap) <= 10,
+    },
+    {
+      g: "Share at/below reorder point within +/-10pp",
+      got: `${closeShare.toFixed(1)}% vs ${openShare.toFixed(1)}% (${closeShare - openShare >= 0 ? "+" : ""}${(closeShare - openShare).toFixed(1)}pp)`,
+      ok: Math.abs(closeShare - openShare) <= 10,
+    },
+    {
+      g: "Gross margin within 2pp of the seed's last 8 weeks",
+      got: `${simMargin.toFixed(2)}% vs ${patterns.baseMargin.toFixed(2)}% (${marginGap >= 0 ? "+" : ""}${marginGap.toFixed(2)}pp)`,
+      ok: Math.abs(marginGap) <= 2,
+    },
+  ];
+  table(goals, [
+    { label: "", get: (r) => (r.ok ? "OK  " : "MISS") },
+    { label: "Goal", get: (r) => r.g },
+    { label: "Result", get: (r) => r.got },
+  ]);
+
+  if (Math.abs(marginGap) > 2) {
+    console.log(
+      `\n  Margin gap explained: simulated lines are priced from the CURRENT\n` +
+        `  products.unit_price / unit_cost, while the seed figure above comes from the\n` +
+        `  unit_price / unit_cost captured on its own sale_items rows. This script never\n` +
+        `  changes prices or costs, so a gap here means the catalog has moved since\n` +
+        `  those sales were recorded.`
+    );
+  }
+  const missed = goals.filter((g) => !g.ok);
+  if (missed.length > 0) {
+    console.log(
+      `\n  ${missed.length} goal(s) missed. The low stockout rate is prioritised, as\n` +
+        `  instructed: a stockout removes demand from the record and the forecasting\n` +
+        `  models would read the dip as real. Stock level and low-stock share are what\n` +
+        `  give way, because keeping shelves stocked necessarily holds more inventory\n` +
+        `  than today's near-empty state.`
+    );
+  }
 
   section("Before / after");
   table(
     [
-      { k: "Total units in stock (active products)", b: fmtInt(plan.openingTotal), a: fmtInt(plan.closingTotal) },
+      { k: "Total units in stock (active)", b: fmtInt(plan.openingTotal), a: fmtInt(plan.closingTotal) },
       { k: "  units sold by simulated sales", b: "-", a: `-${fmtInt(plan.unitsSold)}` },
-      { k: "  units received by simulated restocks", b: "-", a: `+${fmtInt(plan.unitsIn)}` },
+      { k: "  units received by simulated deliveries", b: "-", a: `+${fmtInt(plan.unitsIn)}` },
+      {
+        k: "Products at/below reorder point",
+        b: `${fmtInt(plan.openingLowStock)} (${openShare.toFixed(1)}%)`,
+        a: `${fmtInt(plan.closingLowStock)} (${closeShare.toFixed(1)}%)`,
+      },
       { k: "Products touched", b: "-", a: fmtInt(touched.size) },
-      { k: "Products never touched", b: "-", a: fmtInt(products.length - touched.size) },
     ],
     [
       { label: "Measure", get: (r) => r.k },
@@ -664,21 +968,9 @@ function printPlan({ plan, products, startTs, now, existingServices }) {
   );
   const expected = plan.openingTotal - plan.unitsSold + plan.unitsIn;
   console.log(
-    `\n  ${expected === plan.closingTotal ? "OK" : "MISMATCH"}: ` +
-      `${fmtInt(plan.openingTotal)} - ${fmtInt(plan.unitsSold)} + ${fmtInt(plan.unitsIn)} = ${fmtInt(expected)}` +
-      ` (expected new total units in stock)`
+    `\n  ${expected === plan.closingTotal ? "OK" : "MISMATCH"}: ${fmtInt(plan.openingTotal)} - ` +
+      `${fmtInt(plan.unitsSold)} + ${fmtInt(plan.unitsIn)} = ${fmtInt(expected)}`
   );
-  const ratio = plan.openingTotal > 0 ? plan.closingTotal / plan.openingTotal : 1;
-  if (ratio > 1.25 || ratio < 0.75) {
-    console.log(
-      `\n  NOTE: total stock changes by ${((ratio - 1) * 100).toFixed(0)}%. Most products currently sit at\n` +
-        `  or below their reorder point, so almost every one triggers a delivery, and\n` +
-        `  a delivery tops a product up to max(reorder_point x 3, monthly demand x 2, 10)\n` +
-        `  - the same rule backfill-ledger uses. The dashboard's "Total units in stock"\n` +
-        `  will move accordingly. Lower the ceiling in lib/ledgerPlan.mjs if that is too\n` +
-        `  much restocking for the demonstration.`
-    );
-  }
 
   section("Revenue for the simulated window");
   table(
@@ -688,6 +980,8 @@ function printPlan({ plan, products, startTs, now, existingServices }) {
       { k: "Parts sales net", v: fmtPeso(round2(plan.salesRevenue - plan.salesCost)) },
       { k: "Services revenue (gross = net, no cost)", v: fmtPeso(plan.servicesRevenue) },
       { k: "Combined gross", v: fmtPeso(round2(plan.salesRevenue + plan.servicesRevenue)) },
+      { k: "Seed daily gross (base window)", v: fmtPeso(round2(patterns.baseRevenue / Math.max(1, patterns.baseDays))) },
+      { k: "Simulated daily gross", v: fmtPeso(round2(plan.salesRevenue / Math.max(1, plan.days))) },
     ],
     [
       { label: "Measure", get: (r) => r.k },
@@ -695,33 +989,31 @@ function printPlan({ plan, products, startTs, now, existingServices }) {
     ]
   );
 
-  section("Products where constraints could not be met");
+  section("Products that still ran short");
   if (plan.shortfalls.size === 0) {
-    console.log("  None - every simulated line was fully satisfied from stock on hand.");
+    console.log("  None - every simulated line was filled from stock on hand.");
   } else {
     console.log(
-      `  ${fmtInt(plan.shortfalls.size)} product(s) ran out mid-window. A line was either\n` +
-        `  trimmed to the units actually on hand or skipped, and a delivery was\n` +
-        `  scheduled - stock is never allowed to go negative.\n`
+      `  ${fmtInt(plan.shortfalls.size)} product(s). A line was trimmed to the units actually\n` +
+        `  on hand, or skipped and another SKU tried; stock never goes negative.\n`
     );
     table(
-      [...plan.shortfalls.entries()].sort((a, b) => b[1] - a[1]).slice(0, 20).map(([sku, n]) => ({ sku, n })),
+      [...plan.shortfalls.entries()].sort((a, b) => b[1] - a[1]).slice(0, 15).map(([sku, n]) => ({ sku, n })),
       [
         { label: "SKU", get: (r) => r.sku },
         { label: "Times short", right: true, get: (r) => fmtInt(r.n) },
       ]
     );
-    if (plan.shortfalls.size > 20) console.log(`  ... and ${fmtInt(plan.shortfalls.size - 20)} more`);
+    if (plan.shortfalls.size > 15) console.log(`  ... and ${fmtInt(plan.shortfalls.size - 15)} more`);
   }
 
-  section("Simulated id ranges (written to scripts/simulated-ids.json on --apply)");
+  section("Simulated id ranges");
   console.log(
-    `  sales    : ${fmtInt(plan.sales.length)} rows, note = 'simulated' (also identifiable by note)\n` +
-      `  services : ${fmtInt(plan.services.length)} rows - the table has no note column, so the\n` +
-      `             service_id range is the only handle. Existing services today:` +
-      ` ${existingServices.map((s) => s.service_id).join(", ") || "none"}\n` +
-      `  Real ids are only known once the rows are inserted, so the file is\n` +
-      `  written by --apply, not by this dry run.`
+    `  sales    : ${fmtInt(plan.sales.length)} rows, note = 'simulated'\n` +
+      `  services : ${fmtInt(plan.services.length)} rows - no note column, so the service_id\n` +
+      `             range is the only handle. Existing services: ${existingServices.map((s) => s.service_id).join(", ") || "none"}\n` +
+      `  Real ids are only known once inserted, so --apply appends them to\n` +
+      `  scripts/simulated-ids.json as a new entry in its "runs" array.`
   );
 
   printSampleLedgers(plan);
@@ -729,8 +1021,6 @@ function printPlan({ plan, products, startTs, now, existingServices }) {
 }
 
 function printSampleLedgers(plan) {
-  // Rebuild per-product movement timelines from the plan, the way the ledger
-  // page would read them.
   const perProduct = new Map();
   const push = (pid, row) => {
     if (!perProduct.has(pid)) perProduct.set(pid, []);
@@ -738,12 +1028,7 @@ function printSampleLedgers(plan) {
   };
   for (const s of plan.sales) {
     for (const l of s.lines) {
-      push(l.product_id, {
-        ts: s.__ts,
-        quantity: -l.quantity,
-        balance_after: l.__balanceAfter,
-        what: "Sold - simulated sale",
-      });
+      push(l.product_id, { ts: s.__ts, quantity: -l.quantity, balance_after: l.__balanceAfter, what: "Sold - simulated sale" });
     }
   }
   for (const m of plan.movements) {
@@ -756,28 +1041,26 @@ function printSampleLedgers(plan) {
     .sort((a, b) => b.sold - a.sold);
   if (ranked.length === 0) return;
 
-  // Three distinct products: the busiest, the quietest, and one that shows a
-  // delivery alongside its sales. The busiest often has a delivery too, so
-  // the third pick skips anything already shown.
   const fast = ranked[0];
   const slow = ranked[ranked.length - 1];
   const shown = new Set([fast?.pid, slow?.pid]);
-  const restocked = ranked.find((r) => !shown.has(r.pid) && r.rows.some((x) => x.quantity > 0));
+  const delivered = ranked.find((r) => !shown.has(r.pid) && r.rows.some((x) => x.quantity > 0));
   const picks = [
     ["Fast-moving", fast],
     ["Slow-moving", slow],
-    ["With a simulated restock", restocked],
+    ["With a simulated delivery", delivered],
   ].filter(([, r]) => r);
 
   for (const [label, entry] of picks) {
     const product = plan.byId.get(entry.pid);
     section(`Sample simulated ledger - ${label}: ${product.sku}`);
+    let lowest = Infinity;
+    for (const r of entry.rows) if (r.balance_after < lowest) lowest = r.balance_after;
     console.log(
-      `  ${product.name}\n  stock before ${fmtInt(product.stock_on_hand)} -> after ${fmtInt(plan.balance.get(entry.pid))}` +
-        ` | reorder point ${fmtInt(product.reorder_point)} | ${fmtInt(entry.rows.length)} new rows`
+      `  ${product.name}\n  stock ${fmtInt(product.stock_on_hand)} -> ${fmtInt(plan.balance.get(entry.pid))}` +
+        ` | reorder point ${fmtInt(product.reorder_point)} | lowest balance ${fmtInt(lowest)}` +
+        ` | ${fmtInt(entry.rows.length)} new rows`
     );
-    const head = entry.rows.slice(0, 5);
-    const tail = entry.rows.slice(Math.max(5, entry.rows.length - 10));
     const render = (list) =>
       table(list, [
         { label: "When (Manila)", get: (r) => manilaStamp(r.ts) },
@@ -787,10 +1070,10 @@ function printSampleLedgers(plan) {
         { label: "Balance", right: true, get: (r) => fmtInt(r.balance_after) },
       ]);
     console.log("\n  First 5:");
-    render(head);
+    render(entry.rows.slice(0, 5));
     if (entry.rows.length > 15) console.log(`\n  ... ${fmtInt(entry.rows.length - 15)} rows omitted ...`);
     console.log(`\n  Last ${Math.min(10, Math.max(0, entry.rows.length - 5))}:`);
-    render(tail);
+    render(entry.rows.slice(Math.max(5, entry.rows.length - 10)));
   }
 }
 
@@ -815,14 +1098,12 @@ function printSampleServices(plan) {
   );
 }
 
-// ------------------------------------------------------------------ apply
+// ---------------------------------------------------------------- apply
 
 async function applyPlan(sb, plan) {
   section("Applying");
 
-  // Sales first, so each sale_id is known before its lines and movement.
-  const salePayload = plan.sales.map((s) => s.sale);
-  const insertedSales = await insertBatched(sb, "sales", salePayload, {
+  const insertedSales = await insertBatched(sb, "sales", plan.sales.map((s) => s.sale), {
     select: "sale_id",
     onProgress: (d, t) => progressLine(`inserting sales ${fmtInt(d)}/${fmtInt(t)}`),
   });
@@ -868,8 +1149,6 @@ async function applyPlan(sb, plan) {
   });
   progressDone(`inserted ${fmtInt(items.length)} sale_items`);
 
-  // All movements in timestamp order, so identity ids follow the ledger's
-  // (movement_ts, movement_id) ordering.
   const allMovements = [...saleMovements, ...plan.movements].sort((a, b) => a.__ts - b.__ts);
   await insertBatched(
     sb,
@@ -887,7 +1166,7 @@ async function applyPlan(sb, plan) {
   );
   progressDone(`inserted ${fmtInt(insertedServices.length)} services`);
 
-  // Stock last, so a failure part-way leaves stock matching the ledger
+  // Stock last: a failure part-way then leaves stock matching the ledger
   // rather than the other way round.
   let updated = 0;
   for (const [productId, value] of plan.balance.entries()) {
@@ -899,31 +1178,49 @@ async function applyPlan(sb, plan) {
   }
   console.log(`  updated stock_on_hand on ${fmtInt(updated)} products`);
 
+  appendManifest({ insertedSales, insertedServices, plan });
+}
+
+function appendManifest({ insertedSales, insertedServices, plan }) {
   const saleIds = insertedSales.map((r) => r.sale_id);
   const serviceIds = insertedServices.map((r) => r.service_id);
-  const manifest = {
+
+  let file = { runs: [] };
+  try {
+    const parsed = JSON.parse(readFileSync(IDS_FILE, "utf8"));
+    if (Array.isArray(parsed.runs)) file = parsed;
+  } catch {
+    // no usable file yet - start a fresh one
+  }
+
+  file.runs.push({
     generatedAt: new Date().toISOString(),
     note: SIMULATED_NOTE,
     window: { from: plan.sales[0]?.sale.sale_ts ?? null, to: plan.sales.at(-1)?.sale.sale_ts ?? null },
     sales: { first: saleIds[0] ?? null, last: saleIds.at(-1) ?? null, count: saleIds.length },
     services: { first: serviceIds[0] ?? null, last: serviceIds.at(-1) ?? null, count: serviceIds.length },
-    howToRemove: [
-      "delete from sale_items where sale_id between <sales.first> and <sales.last>;",
-      "delete from stock_movements where note = 'simulated';",
-      "delete from sales where note = 'simulated';",
-      "delete from services where service_id between <services.first> and <services.last>;",
-      "-- then recompute products.stock_on_hand, or restore it from the backup schema",
-    ],
-  };
-  writeFileSync(IDS_FILE, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
-  console.log(`  wrote ${IDS_FILE}`);
-  console.log(`  sales    sale_id range:    ${manifest.sales.first} .. ${manifest.sales.last}`);
-  console.log(`  services service_id range: ${manifest.services.first} .. ${manifest.services.last}`);
+  });
+  file.howToRemove = [
+    "Simulated sales and stock_movements carry note = 'simulated'.",
+    "Services have no note column, so use the service_id ranges in runs[].",
+    "delete from stock_movements where note = 'simulated';",
+    "delete from sale_items where sale_id in (select sale_id from sales where note = 'simulated');",
+    "delete from sales where note = 'simulated';",
+    "delete from services where service_id between <runs[].services.first> and <runs[].services.last>;",
+    "-- then recompute products.stock_on_hand, or restore it from the backup schema",
+  ];
+
+  writeFileSync(IDS_FILE, `${JSON.stringify(file, null, 2)}\n`, "utf8");
+  console.log(`  appended run ${file.runs.length} to ${IDS_FILE}`);
+  console.log(`  sales    sale_id range:    ${saleIds[0]} .. ${saleIds.at(-1)}`);
+  console.log(`  services service_id range: ${serviceIds[0]} .. ${serviceIds.at(-1)}`);
 }
 
-main().catch((err) => {
-  console.error(`\nFAILED: ${err.message}`);
-  process.exitCode = 1;
-});
-
-export { STORE_OPEN_HOUR, STORE_CLOSE_HOUR };
+// Only run when invoked directly, so the check script can import the pure
+// pieces without hitting the database.
+if (process.argv[1] && process.argv[1].endsWith("simulate-recent-activity.mjs")) {
+  main().catch((err) => {
+    console.error(`\nFAILED: ${err.message}`);
+    process.exitCode = 1;
+  });
+}

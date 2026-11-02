@@ -52,10 +52,11 @@ async function main() {
 
   section("Backfill ledger" + (args.apply ? " -- APPLY" : " -- DRY RUN (no writes)"));
   console.log(`  PostgREST page size in use: ${fmtInt(pageSize)}`);
+  if (args.only) console.log(`  --sku ${args.only}: limited to this one product`);
 
   // ---------------------------------------------------------------- load
   progressLine("loading products...");
-  const products = await pageAll(
+  const allProducts = await pageAll(
     () =>
       sb
         .from("products")
@@ -63,7 +64,15 @@ async function main() {
         .order("product_id"),
     { pageSize, label: "products" }
   );
-  progressDone(`products: ${fmtInt(products.length)}`);
+  progressDone(`products: ${fmtInt(allProducts.length)}`);
+
+  // --sku narrows everything downstream: the plan, the report and the apply.
+  const products = args.only
+    ? allProducts.filter((p) => p.sku.toUpperCase() === args.only.toUpperCase())
+    : allProducts;
+  if (args.only && products.length === 0) {
+    throw new Error(`no product with SKU ${args.only}`);
+  }
 
   progressLine("loading stock_movements...");
   const existingMovements = await pageAll(
@@ -78,6 +87,13 @@ async function main() {
 
   // Already applied? Then there is nothing to do, by definition.
   const alreadyBackfilled = existingMovements.filter((m) => m.note === BACKFILL_NOTE).length;
+
+  // Rows this script wrote on an earlier run, by product.
+  const backfilledByProduct = new Map();
+  for (const m of existingMovements) {
+    if (m.note !== BACKFILL_NOTE) continue;
+    backfilledByProduct.set(m.product_id, (backfilledByProduct.get(m.product_id) ?? 0) + 1);
+  }
 
   progressLine("loading sales...");
   const sales = await pageAll(
@@ -107,11 +123,45 @@ async function main() {
   // A sale line is already in the ledger if any movement references that
   // sale for that product - 'sale:<id>' from confirm_sale, 'edit:<id>' from
   // edit_sale. Never create a second movement for one of those.
+  //
+  // A product whose backfill died mid-way is the one case where its own
+  // earlier rows must NOT be trusted: a half-written ledger would be planned
+  // against the surviving fragment and come out wrong. Such a product is
+  // reset - its 'seed-backfill' rows are dropped and its history rebuilt from
+  // scratch. Detected below, after the uncovered sale lines are known: a
+  // product with backfilled rows AND still-uncovered sales is incomplete.
   const covered = new Set();
+  const coveredByBackfill = new Map();
   for (const m of existingMovements) {
     const ref = (m.reference ?? "").trim();
     const match = /^(sale|edit):(\d+)$/.exec(ref);
-    if (match) covered.add(`${match[2]}:${m.product_id}`);
+    if (!match) continue;
+    const key = `${match[2]}:${m.product_id}`;
+    covered.add(key);
+    if (m.note === BACKFILL_NOTE) {
+      if (!coveredByBackfill.has(m.product_id)) coveredByBackfill.set(m.product_id, new Set());
+      coveredByBackfill.get(m.product_id).add(key);
+    }
+  }
+
+  // First pass: which products still have sale lines with no movement?
+  const hasUncovered = new Set();
+  for (const item of saleItems) {
+    if (!confirmed.has(item.sale_id)) continue;
+    if (covered.has(`${item.sale_id}:${item.product_id}`)) continue;
+    hasUncovered.add(item.product_id);
+  }
+
+  // A product with backfilled rows and uncovered sales is half-done: forget
+  // its backfilled rows so it is replanned whole.
+  const resetProducts = new Set();
+  for (const [productId, count] of backfilledByProduct) {
+    if (!hasUncovered.has(productId)) continue; // complete - leave alone
+    resetProducts.add(productId);
+    void count;
+  }
+  for (const productId of resetProducts) {
+    for (const key of coveredByBackfill.get(productId) ?? []) covered.delete(key);
   }
 
   const byProduct = new Map();
@@ -178,6 +228,9 @@ async function main() {
   for (const m of existingMovements) {
     const slot = byProduct.get(m.product_id);
     if (!slot) continue;
+    // Rows from a half-finished run are being deleted, so they are not
+    // fixed points in the timeline.
+    if (m.note === BACKFILL_NOTE && resetProducts.has(m.product_id)) continue;
     slot.events.push({
       kind: "existing",
       movement_id: m.movement_id,
@@ -276,7 +329,7 @@ async function main() {
     opening: newRows.filter((r) => r.reference === "opening").length,
   };
 
-  const totalBefore = products.reduce((s, p) => s + p.stock_on_hand, 0);
+  const totalBefore = allProducts.reduce((s, p) => s + p.stock_on_hand, 0);
   const endingSum = plans.reduce((s, p) => s + p.result.endingBalance, 0);
   const plannedStockSum = plans.reduce((s, p) => s + p.slot.product.stock_on_hand, 0);
 
@@ -317,7 +370,7 @@ async function main() {
   section("Source data");
   table(
     [
-      { k: "products", v: `${fmtInt(products.length)} (${fmtInt(products.filter((p) => p.is_active).length)} active)` },
+      { k: "products", v: `${fmtInt(allProducts.length)} (${fmtInt(allProducts.filter((p) => p.is_active).length)} active)` },
       { k: "sales", v: `${fmtInt(sales.length)} (${fmtInt(voided)} voided, skipped)` },
       { k: "sale_items", v: fmtInt(saleItems.length) },
       { k: "stock_movements already present", v: fmtInt(existingMovements.length) },
@@ -343,6 +396,7 @@ async function main() {
       { k: "Total units in stock (products touched)", before: fmtInt(plannedStockSum), after: fmtInt(endingSum) },
       { k: "Products touched", before: "-", after: fmtInt(touched) },
       { k: "Products with no sale history", before: "-", after: fmtInt(products.length - touched) },
+      { k: "Products reset after a half-finished run", before: "-", after: fmtInt(resetProducts.size) },
     ],
     [
       { label: "Measure", get: (r) => r.k },
@@ -415,6 +469,53 @@ async function main() {
   }
   console.log("  Ids, types, quantities, references and timestamps are never modified.");
 
+  // The ledger page renders every row with no pagination, so the worst case
+  // is worth knowing before anyone opens it.
+  section("Largest ledgers after backfill (rows the /ledger page would render)");
+  const largest = plans
+    .map((pl) => ({
+      sku: pl.slot.product.sku,
+      name: pl.slot.product.name,
+      total: pl.result.rows.length,
+      sales: pl.result.rows.filter((r) => r.kind === "sale").length,
+      restocks: pl.result.restocks.length,
+      existing: pl.result.rows.filter((r) => r.kind === "existing").length,
+    }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 5);
+  table(largest, [
+    { label: "SKU", get: (r) => r.sku },
+    { label: "Item", get: (r) => (r.name.length > 42 ? `${r.name.slice(0, 41)}~` : r.name) },
+    { label: "Total rows", right: true, get: (r) => fmtInt(r.total) },
+    { label: "Sales", right: true, get: (r) => fmtInt(r.sales) },
+    { label: "Restocks", right: true, get: (r) => fmtInt(r.restocks) },
+    { label: "Existing", right: true, get: (r) => fmtInt(r.existing) },
+  ]);
+  const totalRows = plans.reduce((n, pl) => n + pl.result.rows.length, 0);
+  console.log(
+    `\n  Median ledger: ${fmtInt(medianOf(plans.map((pl) => pl.result.rows.length)))} rows | ` +
+      `mean ${fmtInt(Math.round(totalRows / Math.max(1, plans.length)))} rows`
+  );
+
+  if (resetProducts.size > 0) {
+    section(`Products to reset after a half-finished run (${fmtInt(resetProducts.size)})`);
+    console.log(
+      `  These have '${BACKFILL_NOTE}' rows AND sale lines with no movement, so an\n` +
+        `  earlier run died part-way. Their '${BACKFILL_NOTE}' rows are deleted and the\n` +
+        `  product is rebuilt whole. Nothing without that note is ever deleted.\n`
+    );
+    table(
+      [...resetProducts].map((id) => ({
+        sku: byProduct.get(id)?.product.sku ?? String(id),
+        rows: backfilledByProduct.get(id) ?? 0,
+      })),
+      [
+        { label: "SKU", get: (r) => r.sku },
+        { label: "Rows to delete", right: true, get: (r) => fmtInt(r.rows) },
+      ]
+    );
+  }
+
   // ---------------------------------------------------------- samples
   printSamples(plans, existingMovements);
 
@@ -426,24 +527,82 @@ async function main() {
   }
 
   section("Applying");
-  const payload = newRows.map(({ __ts, __kind, ...row }) => row);
-  await insertBatched(sb, "stock_movements", payload, {
-    onProgress: (done, total) => progressLine(`inserting stock_movements ${fmtInt(done)}/${fmtInt(total)}`),
-  });
-  progressDone(`inserted ${fmtInt(payload.length)} stock_movements rows`);
 
-  for (const change of existingChanges) {
-    const { error } = await sb
-      .from("stock_movements")
-      .update({ balance_after: change.to })
-      .eq("movement_id", change.movement_id);
-    if (error) throw new Error(`updating movement ${change.movement_id} failed: ${error.message}`);
+  // One product at a time, and batches never span products, so a failure
+  // leaves at most one product half-written - and that one is detected and
+  // reset on the next run.
+  const rowsByProduct = new Map();
+  for (const row of newRows) {
+    if (!rowsByProduct.has(row.product_id)) rowsByProduct.set(row.product_id, []);
+    rowsByProduct.get(row.product_id).push(row);
   }
+
+  let doneProducts = 0;
+  let insertedRows = 0;
+  let deletedRows = 0;
+
+  for (const [productId, rows] of rowsByProduct) {
+    const sku = byProduct.get(productId)?.product.sku ?? String(productId);
+    try {
+      // Clear a half-finished earlier attempt for this product first. The
+      // note filter is what keeps this from touching a real movement.
+      if (resetProducts.has(productId)) {
+        const { error: delError, count } = await sb
+          .from("stock_movements")
+          .delete({ count: "exact" })
+          .eq("product_id", productId)
+          .eq("note", BACKFILL_NOTE);
+        if (delError) throw new Error(delError.message);
+        deletedRows += count ?? 0;
+      }
+
+      await insertBatched(
+        sb,
+        "stock_movements",
+        rows.map(({ __ts, __kind, ...row }) => row)
+      );
+      insertedRows += rows.length;
+
+      // This product's existing rows, rebalanced.
+      for (const change of existingChanges.filter((c) => c.sku === sku)) {
+        const { error } = await sb
+          .from("stock_movements")
+          .update({ balance_after: change.to })
+          .eq("movement_id", change.movement_id);
+        if (error) throw new Error(`movement ${change.movement_id}: ${error.message}`);
+      }
+
+      doneProducts += 1;
+      progressLine(`backfilled ${fmtInt(doneProducts)}/${fmtInt(rowsByProduct.size)} products (${sku})`);
+    } catch (err) {
+      progressDone("");
+      console.error(
+        `\n  FAILED on product ${sku} (product_id ${productId}) after ${fmtInt(doneProducts)} complete products.`
+      );
+      console.error(`  ${err.message}`);
+      console.error(
+        `  That product may be half-written. Re-run this script: it will detect the\n` +
+          `  partial state, delete only that product's '${BACKFILL_NOTE}' rows, and redo it.`
+      );
+      throw err;
+    }
+  }
+  progressDone(`backfilled ${fmtInt(doneProducts)} products`);
+
+  console.log(`  inserted ${fmtInt(insertedRows)} stock_movements rows`);
+  if (deletedRows > 0) console.log(`  deleted ${fmtInt(deletedRows)} stale '${BACKFILL_NOTE}' rows first`);
   console.log(`  updated balance_after on ${fmtInt(existingChanges.length)} existing row(s)`);
 
   const after = await countRows(sb, "stock_movements");
   console.log(`  stock_movements now holds ${fmtInt(after)} rows`);
   console.log("  products.stock_on_hand was not written by this script.");
+}
+
+function medianOf(values) {
+  if (values.length === 0) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 ? sorted[mid] : Math.round((sorted[mid - 1] + sorted[mid]) / 2);
 }
 
 function rank(e) {

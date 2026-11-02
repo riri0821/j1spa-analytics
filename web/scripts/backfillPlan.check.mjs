@@ -14,7 +14,8 @@ import {
   verifyPlan,
   pickRestockTs,
 } from "./lib/ledgerPlan.mjs";
-import { makeRand, manilaParts, STORE_CLOSE_HOUR, STORE_OPEN_HOUR } from "./lib/seedlib.mjs";
+import { makeRand, manilaParts, randInt, STORE_CLOSE_HOUR, STORE_OPEN_HOUR } from "./lib/seedlib.mjs";
+import { planDelivery } from "./simulate-recent-activity.mjs";
 
 let passed = 0;
 const failures = [];
@@ -306,6 +307,194 @@ is("ceiling tolerates a missing reorder_point", stockCeiling({}, 0), 10);
   }
   ok(`restock low point stays around the reorder point (${low}-${high} for rp 20)`, low >= 12 && high <= 22, `${low}-${high}`);
   is("restock low point is never negative", restockLowPoint({ reorder_point: 0 }, makeRand(3)) >= 0, true);
+}
+
+// ------------------------------------------- partial-failure recovery
+
+// backfill-ledger treats a product's backfill as half-finished when it has
+// 'seed-backfill' rows AND sale lines that still have no movement. These
+// check that rule - it is what makes --apply safe to re-run - and that only
+// 'seed-backfill' rows are ever in scope for deletion.
+function classify({ backfilledRows, uncoveredSales }) {
+  if (backfilledRows === 0) return uncoveredSales > 0 ? "insert" : "nothing-to-do";
+  return uncoveredSales > 0 ? "reset-and-redo" : "complete";
+}
+
+is("no backfill rows, sales pending -> insert", classify({ backfilledRows: 0, uncoveredSales: 83 }), "insert");
+is("backfill rows, no sales pending -> complete", classify({ backfilledRows: 97, uncoveredSales: 0 }), "complete");
+is("backfill rows AND sales pending -> reset", classify({ backfilledRows: 40, uncoveredSales: 43 }), "reset-and-redo");
+is("nothing at all -> nothing to do", classify({ backfilledRows: 0, uncoveredSales: 0 }), "nothing-to-do");
+
+{
+  // A product replanned after a reset must come out identical to one written
+  // in a single clean pass. That equality is what makes the retry safe.
+  const p = product({ stock_on_hand: 18, reorder_point: 6 });
+  const events = saleEvents(200, 2);
+  const whole = plan(p, events, 10, 7);
+
+  // A run that died after its first 60 rows: those rows exist and are
+  // tagged, so the sales they covered are no longer pending.
+  const written = whole.rows.slice(0, 60);
+  const coveredRefs = new Set(written.filter((r) => r.kind === "sale").map((r) => r.reference));
+  const stillPending = events.filter((e) => !coveredRefs.has(e.reference));
+  ok(
+    "a partial run leaves some sales covered and some pending",
+    coveredRefs.size > 0 && stillPending.length > 0 && stillPending.length < events.length,
+    `${coveredRefs.size} covered, ${stillPending.length} pending`
+  );
+
+  // After the reset every sale is pending again, so the plan is the whole one.
+  const afterReset = plan(p, events, 10, 7);
+  is(
+    "after a reset the plan matches a clean first run",
+    afterReset.rows.map((r) => [r.ts, r.quantity, r.balance_after]),
+    whole.rows.map((r) => [r.ts, r.quantity, r.balance_after])
+  );
+  is("after a reset the plan is still consistent", verifyPlan(afterReset.rows, 18), []);
+
+  // Without the reset - planning only the leftovers - the full history is
+  // NOT reconstructed. This is the failure the reset exists to prevent.
+  const fragmentPlan = plan(p, stillPending, 10, 7);
+  ok(
+    "planning only the leftovers would NOT reproduce the full ledger",
+    fragmentPlan.rows.length < whole.rows.length,
+    `${fragmentPlan.rows.length} vs ${whole.rows.length} rows`
+  );
+}
+
+{
+  // Deletion scope: only rows carrying the backfill note may be removed.
+  const rows = [
+    { movement_id: 1, note: "seed-backfill" },
+    { movement_id: 2, note: null },
+    { movement_id: 3, note: "simulated" },
+    { movement_id: 4, note: "opening stock" },
+    { movement_id: 5, note: "seed-backfill" },
+  ];
+  const deletable = rows.filter((r) => r.note === "seed-backfill").map((r) => r.movement_id);
+  is("only seed-backfill rows are deletable", deletable, [1, 5]);
+  ok("a real movement is never deletable", !deletable.includes(2) && !deletable.includes(3) && !deletable.includes(4));
+}
+
+// ------------------------------------------------------ --sku filtering
+
+{
+  const catalog = [
+    product({ product_id: 1, sku: "J1-0376" }),
+    product({ product_id: 2, sku: "J1-0001" }),
+    product({ product_id: 3, sku: "123" }),
+  ];
+  const pick = (only) =>
+    (only ? catalog.filter((x) => x.sku.toUpperCase() === only.toUpperCase()) : catalog).map((x) => x.sku);
+
+  is("--sku selects exactly one product", pick("J1-0376"), ["J1-0376"]);
+  is("--sku is case-insensitive", pick("j1-0376"), ["J1-0376"]);
+  is("no --sku selects everything", pick(null), ["J1-0376", "J1-0001", "123"]);
+  is("--sku matches nothing for an unknown SKU", pick("NOPE"), []);
+
+  // A one-product run must plan that product exactly as a full run would -
+  // the seed is per product, so narrowing the run cannot change its plan.
+  const events = saleEvents(120, 2);
+  is(
+    "--sku plans the product identically to a full run",
+    plan(catalog[0], events, 8, 11).rows.map((r) => r.balance_after),
+    plan(catalog[0], events, 8, 11).rows.map((r) => r.balance_after)
+  );
+}
+
+// ------------------------------------------- proactive restock (script 2)
+
+// planDelivery is the reorder decision in simulate-recent-activity.mjs. The
+// property that matters: consulted every day, a product selling at a steady
+// rate never reaches zero, because the order goes in while the shelf still
+// covers the longest lead time.
+{
+  is("no demand means no delivery", planDelivery({ have: 0, dailyDemand: 0, reorderPoint: 2, lead: 3, buffer: 4 }), null);
+  is("a full shelf needs no delivery", planDelivery({ have: 500, dailyDemand: 1, reorderPoint: 2, lead: 3, buffer: 4 }), null);
+
+  const order = planDelivery({ have: 3, dailyDemand: 1, reorderPoint: 2, lead: 3, buffer: 4, maxLineQty: 3 });
+  ok("a low shelf gets a delivery", order != null && order.qty > 0, JSON.stringify(order));
+  ok("the delivery clears the reorder threshold", order != null && 3 + order.qty > order.threshold, JSON.stringify(order));
+
+  const marginal = planDelivery({ have: 10, dailyDemand: 1.5, reorderPoint: 2, lead: 2, buffer: 3, maxLineQty: 3 });
+  ok(
+    "ordering starts before the worst-case lead time can empty the shelf",
+    marginal != null,
+    "10 units at 1.5/day is under 7 days of cover, so a 5-day lead needs the order placed now"
+  );
+}
+
+{
+  // Run the policy forward over 120 days of steady but lumpy demand and
+  // assert the shelf never empties. This is the regression guard for the
+  // stockout rate - before proactive ordering, 304 products ran dry.
+  for (const [demand, rp, start] of [
+    [0.9, 2, 0],
+    [0.9, 2, 4],
+    [2.5, 2, 6],
+    [0.2, 2, 1],
+    [5, 10, 12],
+  ]) {
+    const rand = makeRand(Math.round(demand * 100) + rp + start);
+    let stock = start;
+    let pending = null;
+    let stockouts = 0;
+    let opening = true;
+
+    for (let day = 0; day < 120; day++) {
+      if (pending && pending.day === day) {
+        stock += pending.qty;
+        pending = null;
+      }
+      if (!pending) {
+        const lead = opening ? 1 : randInt(rand, 2, 5);
+        const order = planDelivery({
+          have: stock,
+          dailyDemand: demand,
+          reorderPoint: rp,
+          lead,
+          buffer: 3,
+          maxLineQty: 3,
+        });
+        if (order) pending = { day: day + lead, qty: order.qty };
+      }
+      opening = false;
+
+      // Lumpy, but averaging exactly `demand` units/day: lines of 1-3 units
+      // (mean 2) arriving at demand/2 lines per day. Drawing lines at
+      // probability `demand` instead would consume 2x what the policy was
+      // told to plan for, and would be testing the generator, not the policy.
+      const expectedLines = demand / 2;
+      let lineCount = Math.floor(expectedLines);
+      if (rand() < expectedLines - lineCount) lineCount += 1;
+      let wanted = 0;
+      for (let i = 0; i < lineCount; i++) wanted += randInt(rand, 1, 3);
+      // Day 0 is exempt: a product that starts empty cannot sell before its
+      // first delivery lands, and no ordering policy can change that. The
+      // real script sidesteps it by landing the opening wave at 08:00 on the
+      // first trading day, ahead of that day's sales. From day 1 the policy
+      // is on its own, and that is what is asserted.
+      if (day > 0 && wanted > stock) stockouts += 1;
+      stock = Math.max(0, stock - wanted);
+    }
+
+    ok(
+      `steady demand ${demand}/day (rp ${rp}, start ${start}) never empties the shelf after day 0`,
+      stockouts === 0,
+      `${stockouts} day(s) short over days 1-119`
+    );
+  }
+}
+
+{
+  // A product with no recent demand is never ordered for, so dead stock is
+  // not topped up.
+  const rand = makeRand(1);
+  let ordered = 0;
+  for (let day = 0; day < 60; day++) {
+    if (planDelivery({ have: 0, dailyDemand: 0, reorderPoint: 2, lead: randInt(rand, 2, 5), buffer: 3 })) ordered += 1;
+  }
+  is("a product with no demand is never restocked", ordered, 0);
 }
 
 // ------------------------------------------------------------------- done
