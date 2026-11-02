@@ -378,9 +378,10 @@ create policy "products_write" on products for all
   using (current_user_role() = 'owner')
   with check (current_user_role() = 'owner');
 
--- sales / sale_items / stock_movements: any signed-in user can read and
--- insert (both roles record sales and stock-in); only owners can update
--- or delete (e.g. voiding a sale).
+-- sales / sale_items: any signed-in user can read and insert (both roles
+-- record sales); only owners can update or delete (e.g. voiding a sale).
+-- stock_movements is read by both roles but inserted only by the owner -
+-- staff sales reach it through security-definer functions instead.
 create policy "sales_select" on sales for select
   using (auth.role() = 'authenticated');
 create policy "sales_insert" on sales for insert
@@ -395,8 +396,12 @@ create policy "sale_items_insert" on sale_items for insert
 
 create policy "stock_movements_select" on stock_movements for select
   using (auth.role() = 'authenticated');
+-- inserts are owner-only: staff sales/voids reach this table through the
+-- security-definer functions (confirm_sale, undo_sale, edit_sale), which
+-- bypass RLS, so staff never need direct insert rights. See
+-- sql/supabase_fix_stockin_owner_only.sql.
 create policy "stock_movements_insert" on stock_movements for insert
-  with check (auth.role() = 'authenticated');
+  with check (current_user_role() = 'owner');
 -- owners can reassign user_id when deleting a staff account
 create policy "stock_movements_owner_write" on stock_movements for update
   using (current_user_role() = 'owner');
@@ -887,6 +892,12 @@ begin
   v_role := current_user_role();
   if v_role is null then
     raise exception 'No profile found for this account.';
+  end if;
+  -- Stock In is an owner-only screen; without this a staff session could
+  -- call this RPC straight from the browser and move stock anyway, because
+  -- a security-definer function bypasses the table's RLS policies.
+  if v_role <> 'owner' then
+    raise exception 'Only the owner can record stock movements.';
   end if;
 
   if items is null or jsonb_array_length(items) = 0 then
