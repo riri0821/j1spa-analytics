@@ -756,10 +756,17 @@ function printSampleLedgers(plan) {
     .sort((a, b) => b.sold - a.sold);
   if (ranked.length === 0) return;
 
+  // Three distinct products: the busiest, the quietest, and one that shows a
+  // delivery alongside its sales. The busiest often has a delivery too, so
+  // the third pick skips anything already shown.
+  const fast = ranked[0];
+  const slow = ranked[ranked.length - 1];
+  const shown = new Set([fast?.pid, slow?.pid]);
+  const restocked = ranked.find((r) => !shown.has(r.pid) && r.rows.some((x) => x.quantity > 0));
   const picks = [
-    ["Fast-moving", ranked[0]],
-    ["Slow-moving", ranked[ranked.length - 1]],
-    ["With a simulated restock", ranked.find((r) => r.rows.some((x) => x.quantity > 0))],
+    ["Fast-moving", fast],
+    ["Slow-moving", slow],
+    ["With a simulated restock", restocked],
   ].filter(([, r]) => r);
 
   for (const [label, entry] of picks) {
