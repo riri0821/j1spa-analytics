@@ -56,14 +56,18 @@ export default function Topbar({ fullName, role }) {
             className="absolute right-0 top-11 w-48 overflow-hidden rounded-lg border shadow-lg"
             style={{ backgroundColor: theme.cardBg, borderColor: theme.border }}
           >
-            <a
-              href="/settings"
-              className="flex items-center gap-2 px-3 py-2 text-sm hover:bg-white/5"
-              style={{ color: theme.textSecondary }}
-            >
-              <Settings className="h-4 w-4" />
-              Account Settings
-            </a>
+            {/* /settings is owner-only (it manages staff accounts), so staff
+                get Sign Out as the only item in this menu. */}
+            {role === "owner" && (
+              <a
+                href="/settings"
+                className="flex items-center gap-2 px-3 py-2 text-sm hover:bg-white/5"
+                style={{ color: theme.textSecondary }}
+              >
+                <Settings className="h-4 w-4" />
+                Account Settings
+              </a>
+            )}
             <SignOutButton className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-white/5" style={{ color: theme.textSecondary }}>
               <LogOut className="h-4 w-4" />
               Sign Out

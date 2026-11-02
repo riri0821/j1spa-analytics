@@ -36,8 +36,12 @@ function rangeStart(range) {
   return start < cutoff ? cutoff : start;
 }
 
-export default function SalesTracker() {
+export default function SalesTracker({ role }) {
   const supabase = createClient();
+  // Peso amounts (the window total, each record's total, and per-line
+  // totals in the expanded detail) are owner-only on this screen, same as
+  // unit cost and gross profit elsewhere in Sales.
+  const isOwner = role === "owner";
   const [range, setRange] = useState("month");
   const [records, setRecords] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -134,7 +138,7 @@ export default function SalesTracker() {
               <th className="px-2 py-1 text-left font-normal">Name</th>
               <th className="px-2 py-1 text-right font-normal">Qty</th>
               <th className="px-2 py-1 text-right font-normal">Unit price</th>
-              <th className="px-2 py-1 text-right font-normal">Line total</th>
+              {isOwner && <th className="px-2 py-1 text-right font-normal">Line total</th>}
             </tr>
           </thead>
           <tbody>
@@ -144,7 +148,9 @@ export default function SalesTracker() {
                 <td className="px-2 py-1">{it.products?.name}</td>
                 <td className="px-2 py-1 text-right">{it.quantity}</td>
                 <td className="px-2 py-1 text-right">{Number(it.unit_price).toFixed(2)}</td>
-                <td className="px-2 py-1 text-right">{Number(it.line_revenue).toFixed(2)}</td>
+                {isOwner && (
+                  <td className="px-2 py-1 text-right">{Number(it.line_revenue).toFixed(2)}</td>
+                )}
               </tr>
             ))}
           </tbody>
@@ -157,14 +163,16 @@ export default function SalesTracker() {
 
   return (
     <div className="flex flex-col gap-4" style={{ color: theme.textSecondary }}>
-      <div>
-        <p className="text-xs" style={{ color: theme.textMuted }}>
-          Total (sales + services) in this window
-        </p>
-        <p className="text-2xl font-semibold" style={{ color: theme.textPrimary }}>
-          {totalAmount.toFixed(2)}
-        </p>
-      </div>
+      {isOwner && (
+        <div>
+          <p className="text-xs" style={{ color: theme.textMuted }}>
+            Total (sales + services) in this window
+          </p>
+          <p className="text-2xl font-semibold" style={{ color: theme.textPrimary }}>
+            {totalAmount.toFixed(2)}
+          </p>
+        </div>
+      )}
 
       <div className="flex items-center justify-between">
         <p className="text-sm" style={{ color: theme.textMuted }}>
@@ -202,7 +210,9 @@ export default function SalesTracker() {
             { label: "Type", render: (r) => r.kind },
             { label: "Cashier", render: (r) => r.profiles?.full_name ?? "Former staff" },
             { label: "Detail", render: (r) => r.detail },
-            { label: "Total", align: "right", render: (r) => Number(r.total_amount).toFixed(2) },
+            ...(isOwner
+              ? [{ label: "Total", align: "right", render: (r) => Number(r.total_amount).toFixed(2) }]
+              : []),
           ]}
           fetchDetail={fetchDetail}
           emptyMessage="No sales or services in this window."

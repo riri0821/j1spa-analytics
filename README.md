@@ -29,10 +29,11 @@ the fly rather than a separately-synced star schema.
 
 ## 2. Roles
 
-* **owner** → full access: dashboard, forecasting, decision support, products, sales
-  entry, stock-in, services, settings (staff account management).
-* **staff** → sales entry + stock-in only. No cost, gross profit, analytics,
-  forecasts, or advisories.
+* **owner** → full access: dashboard, forecasting, decision support, per-product
+  stock ledgers, products, sales entry, stock-in, services, settings (staff
+  account management).
+* **staff** → sales entry + services only. No stock-in, cost, gross profit,
+  analytics, forecasts, or advisories.
 
 Enforced both at the page level (role check + redirect) and at the database level
 (Postgres Row Level Security policies) — not just hidden in the UI.
@@ -49,8 +50,12 @@ web/                        the live application
     forecasting/              5-model demand forecasting workspace (owner)
     decision-support/          low-stock / demand-spike / overstock advisories,
                                 with owner-settable manual overrides per SKU
-    sales/                    Sales Entry, Services, Sales Tracker (owner + staff)
-    stockin/                  Stock In + Stock-In Tracker (owner + staff)
+    ledger/[sku]/             per-product stock ledger (stock card): derived
+                               opening balance, every stock movement, running
+                               balance, date range in Manila time (owner)
+    sales/                    Sales Entry, Services, Sales Tracker (owner + staff;
+                               the tracker's peso totals are owner-only)
+    stockin/                  Stock In + Stock-In Tracker (owner)
     products/                  product catalog management (owner)
     settings/                  staff account management (owner)
     login/, reset-password/, auth/confirm/

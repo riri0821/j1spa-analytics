@@ -6,6 +6,7 @@ import {
   TrendingUp,
   Lightbulb,
   ShoppingCart,
+  Wrench,
   PackagePlus,
   Package,
   ChevronsLeft,
@@ -16,6 +17,10 @@ import { theme } from "./theme";
 import SignOutButton from "@/components/SignOutButton";
 import Topbar from "./Topbar";
 
+// `staff: true` marks the only destinations a staff account may reach -
+// sales entry and service entry. Everything else is owner-only. This drives
+// what renders in the nav; the matching server-side redirects in each
+// page.js are what actually enforce it.
 const NAV = [
   {
     section: "Analytics",
@@ -28,12 +33,20 @@ const NAV = [
   {
     section: "Operations",
     items: [
-      { href: "/sales", label: "Sales Entry", key: "sales", icon: ShoppingCart },
+      { href: "/sales", label: "Sales Entry", key: "sales", icon: ShoppingCart, staff: true },
+      { href: "/sales?tab=services", label: "Service", key: "services", icon: Wrench, staff: true },
       { href: "/stockin", label: "Stock In", key: "stockin", icon: PackagePlus },
       { href: "/products", label: "Products", key: "products", icon: Package },
     ],
   },
 ];
+
+function navFor(role) {
+  if (role === "owner") return NAV;
+  return NAV.map((group) => ({ ...group, items: group.items.filter((i) => i.staff) })).filter(
+    (group) => group.items.length > 0
+  );
+}
 
 const COLLAPSE_KEY = "j1spa.sidebar.collapsed";
 
@@ -143,7 +156,7 @@ export default function Sidebar({ active = "dashboard", fullName, role }) {
           </button>
         </div>
 
-        {NAV.map((group) => (
+        {navFor(role).map((group) => (
           <div key={group.section} className="flex flex-col gap-1">
             <p
               className={`mb-1 px-2 text-[10px] font-semibold uppercase tracking-wide ${collapsed ? "md:hidden" : ""}`}

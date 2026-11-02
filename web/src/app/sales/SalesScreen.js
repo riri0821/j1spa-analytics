@@ -10,10 +10,10 @@ import RecordsTable, { CustomerDetail } from "./RecordsTable";
 const inputClass = "rounded border px-3 py-1.5 text-sm";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
 
-export default function SalesScreen({ userId, role }) {
+export default function SalesScreen({ userId, role, initialTab = "entry" }) {
   const supabase = createClient();
 
-  const [tab, setTab] = useState("entry"); // "entry" | "tracker"
+  const [tab, setTab] = useState(initialTab); // "entry" | "services" | "tracker"
   const [search, setSearch] = useState("");
   const [results, setResults] = useState([]);
   const [cart, setCart] = useState([]); // [{product_id, sku, name, unit_price, stock_on_hand, qty}]
@@ -343,7 +343,7 @@ export default function SalesScreen({ userId, role }) {
         </button>
       </div>
 
-      {tab === "tracker" && <SalesTracker />}
+      {tab === "tracker" && <SalesTracker role={role} />}
       {tab === "services" && <ServicesScreen userId={userId} role={role} />}
 
       {tab === "entry" && (
