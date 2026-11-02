@@ -2,38 +2,29 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
+import { pagedQuery } from "@/lib/analytics";
 import { theme } from "../dashboard/theme";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
+import DateWindowPicker, { useDateWindow } from "@/components/DateWindowPicker";
 
-const MAX_LOOKBACK_MONTHS = 18;
+// .in() goes into the request URL, so a year of sales would build a query
+// string long enough for the server to reject. The ids are sent in chunks.
+const ID_CHUNK = 200;
 
-const RANGES = [
-  { value: "day", label: "Today" },
-  { value: "week", label: "This week" },
-  { value: "month", label: "This month" },
-  { value: "year", label: "This year" },
-];
-
-function rangeStart(range) {
-  const now = new Date();
-  const start = new Date(now);
-  start.setHours(0, 0, 0, 0);
-
-  if (range === "day") {
-    // already at today's midnight
-  } else if (range === "week") {
-    const dow = (start.getDay() + 6) % 7; // 0 = Monday
-    start.setDate(start.getDate() - dow);
-  } else if (range === "month") {
-    start.setDate(1);
-  } else if (range === "year") {
-    start.setMonth(0, 1);
+// One count per sale, paged and chunked - a busy window has more than 1000
+// line items, and the old single unpaged .in() silently kept only the first
+// 1000, under-reporting "N line(s)".
+async function countSaleLines(supabase, saleIds) {
+  const counts = {};
+  for (let i = 0; i < saleIds.length; i += ID_CHUNK) {
+    const chunk = saleIds.slice(i, i + ID_CHUNK);
+    const { rows, error } = await pagedQuery(() =>
+      supabase.from("sale_items").select("sale_id").in("sale_id", chunk).order("sale_item_id")
+    );
+    if (error) return { counts, error };
+    for (const item of rows) counts[item.sale_id] = (counts[item.sale_id] ?? 0) + 1;
   }
-
-  const cutoff = new Date(now);
-  cutoff.setMonth(cutoff.getMonth() - MAX_LOOKBACK_MONTHS);
-
-  return start < cutoff ? cutoff : start;
+  return { counts, error: null };
 }
 
 export default function SalesTracker({ role }) {
@@ -42,56 +33,70 @@ export default function SalesTracker({ role }) {
   // totals in the expanded detail) are owner-only on this screen, same as
   // unit cost and gross profit elsewhere in Sales.
   const isOwner = role === "owner";
-  const [range, setRange] = useState("month");
+  // Same Day/Week/Month/Year windows as the dashboard's Gross & Net chart,
+  // kept in the URL under st=/stStart= so it cannot collide with the Sales
+  // page's own ?tab=.
+  const { granularity, start, window: win, setWindow } = useDateWindow("st");
   const [records, setRecords] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  const { startInstant, endInstantExclusive } = win;
+
   const load = useCallback(
-    async (r) => {
+    async () => {
       setLoading(true);
       setError("");
-      const since = rangeStart(r).toISOString();
 
+      // Both bounds, as Manila-time instants: the window is closed at the
+      // top now, so paging back shows that period alone rather than
+      // everything since it.
       const [salesRes, servicesRes] = await Promise.all([
-        supabase
-          .from("sales")
-          .select(
-            "sale_id, sale_ts, total_amount, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
-          )
-          .eq("status", "confirmed")
-          .gte("sale_ts", since)
-          .order("sale_id", { ascending: false })
-          .limit(1000),
-        supabase
-          .from("services")
-          .select(
-            "service_id, service_ts, service_type, total_amount, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
-          )
-          .eq("status", "confirmed")
-          .gte("service_ts", since)
-          .order("service_id", { ascending: false })
-          .limit(1000),
+        pagedQuery(() =>
+          supabase
+            .from("sales")
+            .select(
+              "sale_id, sale_ts, total_amount, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
+            )
+            .eq("status", "confirmed")
+            .gte("sale_ts", startInstant)
+            .lt("sale_ts", endInstantExclusive)
+            .order("sale_id", { ascending: false })
+        ),
+        pagedQuery(() =>
+          supabase
+            .from("services")
+            .select(
+              "service_id, service_ts, service_type, total_amount, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
+            )
+            .eq("status", "confirmed")
+            .gte("service_ts", startInstant)
+            .lt("service_ts", endInstantExclusive)
+            .order("service_id", { ascending: false })
+        ),
       ]);
 
       if (salesRes.error || servicesRes.error) {
         setLoading(false);
-        setError(salesRes.error?.message || servicesRes.error?.message);
+        setError(salesRes.error || servicesRes.error);
         return;
       }
 
-      const sales = salesRes.data ?? [];
-      const services = servicesRes.data ?? [];
+      const sales = salesRes.rows;
+      const services = servicesRes.rows;
 
       let lineCounts = {};
       if (sales.length > 0) {
-        const { data: items } = await supabase
-          .from("sale_items")
-          .select("sale_id")
-          .in("sale_id", sales.map((s) => s.sale_id));
-        (items ?? []).forEach((it) => {
-          lineCounts[it.sale_id] = (lineCounts[it.sale_id] ?? 0) + 1;
-        });
+        const { counts, error: countError } = await countSaleLines(
+          supabase,
+          sales.map((s) => s.sale_id)
+        );
+        if (countError) {
+          setLoading(false);
+          setError(countError);
+          return;
+        }
+        lineCounts = counts;
       }
 
       const saleRows = sales.map((s) => ({
@@ -112,13 +117,13 @@ export default function SalesTracker({ role }) {
       setRecords([...saleRows, ...serviceRows].sort((a, b) => new Date(b.ts) - new Date(a.ts)));
       setLoading(false);
     },
-    [supabase]
+    [supabase, startInstant, endInstantExclusive]
   );
 
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
-    load(range);
-  }, [range, load]);
+    load();
+  }, [load]);
 
   async function fetchDetail(row) {
     if (row.kind === "Service") return <CustomerDetail row={row} />;
@@ -174,26 +179,11 @@ export default function SalesTracker({ role }) {
         </div>
       )}
 
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-sm" style={{ color: theme.textMuted }}>
-          View-only record of confirmed sales and services, capped to the trailing {MAX_LOOKBACK_MONTHS} months.
+          View-only record of confirmed sales and services.
         </p>
-        <div className="flex gap-1 rounded border p-1" style={{ borderColor: theme.border }}>
-          {RANGES.map((r) => (
-            <button
-              key={r.value}
-              onClick={() => setRange(r.value)}
-              className="rounded px-3 py-1 text-xs font-medium"
-              style={
-                range === r.value
-                  ? { backgroundColor: theme.accent, color: "#05230f" }
-                  : { color: theme.textSecondary }
-              }
-            >
-              {r.label}
-            </button>
-          ))}
-        </div>
+        <DateWindowPicker granularity={granularity} start={start} onChange={setWindow} label={win.label} />
       </div>
 
       {error && <p className="text-sm text-red-400">{error}</p>}

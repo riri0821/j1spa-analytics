@@ -51,19 +51,31 @@ export async function getMarginTrend(supabase) {
 // a truncated read would understate the stock figures without erroring.
 const PAGE_SIZE = 1000;
 
-export async function fetchAllRows(query) {
-  const all = [];
+/**
+ * Pages a query to exhaustion, returning whatever it read plus the first
+ * error. `query` is a thunk because a Supabase builder is single-use - each
+ * page needs a fresh one. Give the query a stable .order(): without a sort,
+ * separate range requests may order rows differently and pages can overlap.
+ */
+export async function pagedQuery(query) {
+  const rows = [];
   for (let offset = 0; ; offset += PAGE_SIZE) {
     const { data, error } = await query().range(offset, offset + PAGE_SIZE - 1);
-    if (error) {
-      // Degrade like the other readers here rather than 500 the whole
-      // dashboard, but say plainly that the totals below are now short.
-      console.error(`paged read failed at offset ${offset} - totals will be understated:`, error.message);
-      return all;
-    }
-    all.push(...(data ?? []));
-    if (!data || data.length < PAGE_SIZE) return all;
+    if (error) return { rows, error: error.message, offset };
+    rows.push(...(data ?? []));
+    if (!data || data.length < PAGE_SIZE) return { rows, error: null };
   }
+}
+
+/** pagedQuery for callers that just want the rows and a logged failure. */
+export async function fetchAllRows(query) {
+  const { rows, error, offset } = await pagedQuery(query);
+  if (error) {
+    // Degrade like the other readers here rather than 500 the whole
+    // dashboard, but say plainly that the totals below are now short.
+    console.error(`paged read failed at offset ${offset} - totals will be understated:`, error);
+  }
+  return rows;
 }
 
 export async function getProductPerformance(supabase) {
