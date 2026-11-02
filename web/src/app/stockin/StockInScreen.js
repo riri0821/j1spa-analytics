@@ -111,7 +111,9 @@ export default function StockInScreen() {
   async function saveSupplier(product_id) {
     const value = supplierDraft.trim() || "Unknown";
     // RPC (security definer), not a direct table update - products writes
-    // are owner-only under RLS, but Stock In is also used by staff.
+    // are owner-only under RLS. The RPC enforces the owner role itself now
+    // that Stock In is owner-only (sql/supabase_fix_supplier_owner_only.sql),
+    // so bypassing RLS no longer means bypassing the role check.
     const { error: updateError } = await supabase.rpc("set_product_supplier", {
       p_product_id: product_id,
       p_supplier: value,

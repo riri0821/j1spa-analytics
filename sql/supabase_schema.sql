@@ -854,6 +854,13 @@ begin
   if v_role is null then
     raise exception 'No profile found for this account.';
   end if;
+  -- Stock In, the one screen that calls this, is owner-only now; without
+  -- this a staff session could rename any product's supplier straight from
+  -- the browser, because a security-definer function bypasses the
+  -- products_write RLS policy that would otherwise stop it.
+  if v_role <> 'owner' then
+    raise exception 'Only the owner can change a product''s supplier.';
+  end if;
 
   update products set supplier = coalesce(nullif(trim(p_supplier), ''), 'Unknown')
     where product_id = p_product_id;
