@@ -82,7 +82,9 @@ export default function TrackingTable({ rows }) {
               <th className="px-3 py-2 font-normal">Item name</th>
               <th className="px-3 py-2 font-normal">Category</th>
               <th className="px-3 py-2 font-normal">Movement</th>
-              <th className="px-3 py-2 font-normal">Stock level</th>
+              {/* "Balance" rather than "Stock level" so it reads as the same
+                  figure as the Balance column in the ledger this SKU opens. */}
+              <th className="px-3 py-2 font-normal">Balance</th>
               <th className="px-3 py-2 font-normal">Status</th>
             </tr>
           </thead>
