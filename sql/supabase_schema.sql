@@ -1208,6 +1208,96 @@ $$;
 
 grant execute on function dashboard_gross_net_summary(text, integer) to authenticated, service_role;
 
+-- dashboard_gross_net_range(): the same revenue definition as
+-- dashboard_gross_net_summary() above, but for an arbitrary date range in
+-- explicit buckets - what the chart's calendar start-date picker needs.
+-- Buckets on Manila local time rather than a UTC date cast, so a sale made
+-- between midnight and 8 AM Manila is counted on the day it happened; the
+-- function above is left as it is. Empty buckets come back as zero rows.
+-- See sql/supabase_add_gross_net_range.sql.
+
+create or replace function dashboard_gross_net_range(
+  p_start date,
+  p_end date,
+  p_bucket text
+)
+returns table(
+  period_start timestamp,
+  gross numeric,
+  net numeric
+)
+language plpgsql
+stable
+as $$
+declare
+  v_step interval;
+begin
+  -- Validate up front: a bad bucket would otherwise reach date_trunc() as
+  -- a confusing internal error, and an unbounded range could ask Postgres
+  -- for millions of buckets.
+  if p_bucket is null or p_bucket not in ('hour', 'day', 'month') then
+    raise exception 'Unknown bucket %. Use ''hour'', ''day'' or ''month''.', coalesce(p_bucket, '(null)');
+  end if;
+  if p_start is null or p_end is null then
+    raise exception 'p_start and p_end are both required.';
+  end if;
+  if p_end < p_start then
+    raise exception 'p_end (%) is before p_start (%).', p_end, p_start;
+  end if;
+  if (p_end - p_start) > 400 then
+    raise exception 'Range too wide: % days (maximum 400).', (p_end - p_start);
+  end if;
+
+  v_step := case p_bucket
+              when 'hour' then interval '1 hour'
+              when 'day' then interval '1 day'
+              else interval '1 month'
+            end;
+
+  return query
+    with combined as (
+      -- `at time zone 'Asia/Manila'` turns each timestamptz into Manila
+      -- local wall-clock time (a plain timestamp), which is the basis every
+      -- bucket boundary below is also expressed in.
+      select
+        (sale_ts at time zone 'Asia/Manila') as ts,
+        total_amount                         as amount,
+        total_cost                           as cost
+      from sales
+      where status = 'confirmed'
+      union all
+      select
+        (service_ts at time zone 'Asia/Manila') as ts,
+        total_amount                            as amount,
+        0::numeric                              as cost
+      from services
+      where status = 'confirmed'
+    ),
+    buckets as (
+      -- The series runs to the last bucket that starts inside the range:
+      -- p_end is inclusive, so the ceiling is one microsecond before the
+      -- start of the day after p_end.
+      select generate_series(
+        date_trunc(p_bucket, p_start::timestamp),
+        date_trunc(p_bucket, (p_end + 1)::timestamp - interval '1 microsecond'),
+        v_step
+      ) as bucket_start
+    )
+    select
+      buckets.bucket_start::timestamp                          as period_start,
+      coalesce(sum(combined.amount), 0)::numeric               as gross,
+      coalesce(sum(combined.amount - combined.cost), 0)::numeric as net
+    from buckets
+    left join combined
+      on combined.ts >= buckets.bucket_start
+     and combined.ts <  buckets.bucket_start + v_step
+    group by buckets.bucket_start
+    order by buckets.bucket_start asc;
+end;
+$$;
+
+grant execute on function dashboard_gross_net_range(date, date, text) to authenticated, service_role;
+
 
 -- =====================================================================
 --  Add: dashboard_margin_trend() - trailing 12 calendar months (including
