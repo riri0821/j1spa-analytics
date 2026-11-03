@@ -28,6 +28,16 @@ import {
   yearOptions,
 } from "@/lib/grossNetRange";
 
+// What the jump-to-current button says for each granularity. "Today" is
+// wrong for the other three - pressing it in Month mode selects the whole
+// month, not the day.
+const CURRENT_PERIOD_LABEL = {
+  day: "Today",
+  week: "This week",
+  month: "This month",
+  year: "This year",
+};
+
 // Shared Day/Week/Month/Year period picker, used by the dashboard's Gross &
 // Net chart, the Sales Tracker and the Stock-In Tracker so all three pick
 // dates the same way. All the date maths lives in lib/grossNetRange.js; this
@@ -202,7 +212,23 @@ export default function DateWindowPicker({ granularity, start, onChange }) {
           className={btn}
           style={btnStyle}
         >
-          Today
+          {/* All four labels occupy the same grid cell, so the button is as
+              wide as the longest of them and keeps that width when the
+              granularity changes - the arrows beside it would otherwise
+              shift sideways on every toggle. Only the active label is
+              visible, and visibility:hidden keeps the rest out of the
+              accessibility tree too. */}
+          <span className="grid">
+            {GRANULARITIES.map((g) => (
+              <span
+                key={g.value}
+                className="col-start-1 row-start-1 text-center"
+                style={{ visibility: g.value === granularity ? "visible" : "hidden" }}
+              >
+                {CURRENT_PERIOD_LABEL[g.value]}
+              </span>
+            ))}
+          </span>
         </button>
       </div>
     </div>
