@@ -110,10 +110,6 @@ export default function GrossNetChart() {
         <DateWindowPicker granularity={granularity} start={start} onChange={setWindow} />
       </div>
 
-      <p className="text-xs tabular-nums" style={{ color: theme.textMuted }}>
-        {win.label}
-      </p>
-
       {error ? (
         <p className="text-xs" style={{ color: error === MISSING_FUNCTION ? theme.textMuted : "#f87171" }}>
           {error}

@@ -146,7 +146,7 @@ export default function StockInTracker() {
         <p className="text-sm" style={{ color: theme.textMuted }}>
           View-only record of stock received. {totalUnits} units.
         </p>
-        <DateWindowPicker granularity={granularity} start={start} onChange={setWindow} label={win.label} />
+        <DateWindowPicker granularity={granularity} start={start} onChange={setWindow} />
       </div>
 
       {error && <p className="text-sm text-red-400">{error}</p>}

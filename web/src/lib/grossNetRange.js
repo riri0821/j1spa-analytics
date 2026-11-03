@@ -1,9 +1,17 @@
 /**
- * Date-window maths for the Day/Week/Month/Year pickers on the Gross & Net
- * chart, the Sales Tracker and the Stock-In Tracker. Pure functions over
+ * Calendar period maths for the Day/Week/Month/Year pickers on the Gross &
+ * Net chart, the Sales Tracker and the Stock-In Tracker. Pure functions over
  * "YYYY-MM-DD" strings - no Date-in-local-time anywhere, because the
  * browser's zone and the server's (UTC on Vercel) would each put the day
  * boundary somewhere other than Manila midnight.
+ *
+ * Every period is calendar-aligned and identified by the date it STARTS on:
+ * a day, a Monday-Sunday week, a whole calendar month, a whole calendar
+ * year. Periods of one granularity tile the calendar exactly, which is what
+ * makes "previous" and "next" mean something and what lets the chart label
+ * its buckets Mon-Sun or Jan-Dec. (They used to be rolling windows - "the 7
+ * days starting on the date you picked" - which never lined up with the
+ * calendar the figures are reported against.)
  *
  * Checked by web/scripts/grossNetRange.check.mjs (`npm run check:gross-net`).
  */
@@ -12,7 +20,29 @@
 // becomes an instant by pinning that offset.
 const MANILA_OFFSET = "+08:00";
 
-const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+export const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+export const MONTH_NAMES = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+
+// Monday-first, matching the week the periods are cut on.
+export const WEEKDAY_ABBR = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"];
+
+// The earliest sale in the data is from 2020, so the year picker opens on a
+// list that starts there rather than scrolling back through empty decades.
+export const EARLIEST_DATA_YEAR = 2020;
 
 const MANILA_PARTS = new Intl.DateTimeFormat("en-US", {
   timeZone: "Asia/Manila",
@@ -77,49 +107,83 @@ export function firstOfMonth(date) {
   return iso(y, m, 1);
 }
 
+export function lastOfMonth(date) {
+  const [y, m] = parts(date);
+  return iso(y, m, daysInMonth(y, m));
+}
+
 export function compareDates(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 
-/**
- * The start date each granularity opens on, chosen so the default window
- * always ENDS today.
- */
-export function defaultStart(granularity, today = todayInManila()) {
-  if (granularity === "day") return today;
-  if (granularity === "week") return addDays(today, -6);
-  // Same date last month + 1 day: the month window runs [start, start+1mo)
-  // so this lands its last day on today.
-  if (granularity === "month") return addDays(addMonths(today, -1), 1);
-  return firstOfMonth(addMonths(today, -11)); // year: 12 calendar months ending this one
+export function sameMonth(a, b) {
+  return a.slice(0, 7) === b.slice(0, 7);
 }
 
 /**
- * The window a (granularity, start) pair describes.
+ * Day of the week, 0 = Monday through 6 = Sunday. Read through Date.UTC so
+ * the answer cannot depend on the machine's zone; getUTCDay() counts from
+ * Sunday, which the shift turns into a Monday-first week.
+ */
+export function dayOfWeek(date) {
+  const [y, m, d] = parts(date);
+  return (new Date(Date.UTC(y, m - 1, d)).getUTCDay() + 6) % 7;
+}
+
+/** The Monday of the week containing `date` (a Sunday belongs to the week before it). */
+export function startOfWeek(date) {
+  return addDays(date, -dayOfWeek(date));
+}
+
+export function startOfYear(date) {
+  return iso(parts(date)[0], 1, 1);
+}
+
+/**
+ * The start of the period of `granularity` that CONTAINS `date`. This is the
+ * one place a loose date becomes a period, so it serves three jobs at once:
+ * defaults (the period containing today), switching granularity while
+ * keeping the same point in time, and reading a ?gnStart= written by the
+ * old rolling-window picker - any date whatsoever snaps to the period around
+ * it rather than being rejected.
+ */
+export function snapToPeriod(granularity, date) {
+  if (granularity === "day") return date;
+  if (granularity === "week") return startOfWeek(date);
+  if (granularity === "month") return firstOfMonth(date);
+  return startOfYear(date);
+}
+
+/**
+ * The period a (granularity, start) pair describes. `start` is snapped
+ * first, so a date from anywhere inside the period - or from an old URL -
+ * names the same period.
+ *
  *   startDate / endDate  inclusive calendar dates
  *   bucket               'hour' | 'day' | 'month', for dashboard_gross_net_range
  *   startInstant         Manila midnight at startDate
  *   endInstantExclusive  Manila midnight the day AFTER endDate
  */
-export function windowFor(granularity, start) {
-  let startDate = start;
+export function periodFor(granularity, start) {
+  const startDate = snapToPeriod(granularity, start);
   let endDate;
   let bucket;
 
   if (granularity === "day") {
+    // 24 hourly buckets.
     endDate = startDate;
     bucket = "hour";
   } else if (granularity === "week") {
+    // 7 daily buckets, Monday through Sunday.
     endDate = addDays(startDate, 6);
     bucket = "day";
   } else if (granularity === "month") {
-    // Through the day before the same date next month.
-    endDate = addDays(addMonths(startDate, 1), -1);
+    // 28-31 daily buckets, the whole calendar month.
+    endDate = lastOfMonth(startDate);
     bucket = "day";
   } else {
-    // Year buckets by calendar month, so the window snaps to month starts.
-    startDate = firstOfMonth(startDate);
-    endDate = addDays(addMonths(startDate, 12), -1);
+    // 12 monthly buckets, Jan through Dec.
+    endDate = iso(parts(startDate)[0], 12, 31);
     bucket = "month";
   }
 
@@ -130,7 +194,7 @@ export function windowFor(granularity, start) {
     bucket,
     startInstant: manilaInstant(startDate),
     endInstantExclusive: manilaInstant(addDays(endDate, 1)),
-    label: rangeLabel(granularity, startDate, endDate),
+    label: periodLabel(granularity, startDate, endDate),
   };
 }
 
@@ -139,32 +203,76 @@ export function manilaInstant(date) {
   return `${date}T00:00:00${MANILA_OFFSET}`;
 }
 
-/** Move the window back (-1) or forward (+1) by exactly one window length. */
+/** Move to the previous (-1) or next (+1) whole period. */
 export function shiftStart(granularity, start, direction) {
-  if (granularity === "day") return addDays(start, direction);
-  if (granularity === "week") return addDays(start, 7 * direction);
-  if (granularity === "month") return addMonths(start, direction);
-  return addMonths(firstOfMonth(start), 12 * direction);
+  const from = snapToPeriod(granularity, start);
+  if (granularity === "day") return addDays(from, direction);
+  if (granularity === "week") return addDays(from, 7 * direction);
+  if (granularity === "month") return addMonths(from, direction);
+  return iso(parts(from)[0] + direction, 1, 1);
 }
 
 /**
- * Whether stepping forward is allowed: the next window must not begin after
- * today, so the user cannot page into empty future periods.
+ * Whether stepping forward is allowed: the next period must not BEGIN after
+ * today. The current period may well run past today - this week, this month
+ * and this year all do - and those buckets simply come back empty.
  */
 export function canGoForward(granularity, start, today = todayInManila()) {
   return compareDates(shiftStart(granularity, start, 1), today) <= 0;
 }
 
-/** "Oct 5 - Oct 11, 2026", with an en dash. */
-export function rangeLabel(granularity, startDate, endDate) {
+/** The period containing today - what each granularity opens on. */
+export function defaultStart(granularity, today = todayInManila()) {
+  return snapToPeriod(granularity, today);
+}
+
+/**
+ * Whether picking `date` would select a period that has not started yet.
+ * One rule for all four granularities, which is what lets the popovers grey
+ * out future cells without caring which kind of cell they are: a day in the
+ * rest of this week is pickable (it selects this week), Dec 1 is not.
+ */
+export function isFuturePeriod(granularity, date, today = todayInManila()) {
+  return compareDates(snapToPeriod(granularity, date), today) > 0;
+}
+
+/** What the picker's trigger button reads. */
+export function periodLabel(granularity, startDate, endDate) {
   const [sy, sm, sd] = parts(startDate);
   const [ey, em, ed] = parts(endDate);
 
-  if (granularity === "day") return `${MONTHS[sm - 1]} ${sd}, ${sy}`;
-  // Year buckets are whole months, so naming days would overstate precision.
-  if (granularity === "year") return `${MONTHS[sm - 1]} ${sy} – ${MONTHS[em - 1]} ${ey}`;
-  if (sy !== ey) return `${MONTHS[sm - 1]} ${sd}, ${sy} – ${MONTHS[em - 1]} ${ed}, ${ey}`;
-  return `${MONTHS[sm - 1]} ${sd} – ${MONTHS[em - 1]} ${ed}, ${sy}`;
+  if (granularity === "day") return `${MONTH_ABBR[sm - 1]} ${sd}, ${sy}`;
+  if (granularity === "month") return `${MONTH_NAMES[sm - 1]} ${sy}`;
+  if (granularity === "year") return String(sy);
+  // Week: named by both ends, with the year stated once unless the week
+  // straddles New Year.
+  if (sy !== ey) return `Week of ${MONTH_ABBR[sm - 1]} ${sd}, ${sy} – ${MONTH_ABBR[em - 1]} ${ed}, ${ey}`;
+  return `Week of ${MONTH_ABBR[sm - 1]} ${sd} – ${MONTH_ABBR[em - 1]} ${ed}, ${sy}`;
+}
+
+/**
+ * Six Monday-Sunday rows of dates covering the month of `date`, including
+ * the days either side that share a row with it. Always six rows, so the
+ * popover keeps one height as the user pages through months, and whole rows
+ * so Week mode can highlight one by hovering any cell in it.
+ */
+export function monthGrid(date) {
+  const gridStart = startOfWeek(firstOfMonth(date));
+  const weeks = [];
+  for (let w = 0; w < 6; w += 1) {
+    const row = [];
+    for (let d = 0; d < 7; d += 1) row.push(addDays(gridStart, w * 7 + d));
+    weeks.push(row);
+  }
+  return weeks;
+}
+
+/** The years the year picker offers: the earliest data year through this one. */
+export function yearOptions(today = todayInManila()) {
+  const current = parts(today)[0];
+  const years = [];
+  for (let y = Math.min(EARLIEST_DATA_YEAR, current); y <= current; y += 1) years.push(y);
+  return years;
 }
 
 /**
@@ -177,12 +285,12 @@ export function bucketLabel(periodStart, bucket) {
   const text = String(periodStart);
   const [datePart, timePart = "00:00:00"] = text.split(/[T ]/);
   const [y, m, d] = parts(datePart);
-  if (bucket === "month") return `${MONTHS[m - 1]} ${String(y).slice(2)}`;
+  if (bucket === "month") return `${MONTH_ABBR[m - 1]} ${String(y).slice(2)}`;
   if (bucket === "hour") {
     const hour = Number(timePart.slice(0, 2));
     const suffix = hour < 12 ? "AM" : "PM";
     const h12 = hour % 12 === 0 ? 12 : hour % 12;
     return `${h12}${suffix}`;
   }
-  return `${MONTHS[m - 1]} ${d}`;
+  return `${MONTH_ABBR[m - 1]} ${d}`;
 }
