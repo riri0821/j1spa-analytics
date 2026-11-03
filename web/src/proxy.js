@@ -43,7 +43,15 @@ export async function proxy(request) {
     "/api/cron/",
   ].some((p) => request.nextUrl.pathname.startsWith(p));
 
-  if (!user && !isPublicPath) {
+  // Every route under /api/ answers for itself: eleven call requireOwner(),
+  // api/forecast/[sku] does the same two checks inline, and
+  // api/cron/warm-forecast authorizes against CRON_SECRET or an owner
+  // session. So a missing session there should reach the route and get its
+  // 401 JSON, rather than a 307 to an HTML login page that fetch() would
+  // follow and then fail to parse as JSON.
+  const isApiPath = request.nextUrl.pathname.startsWith("/api/");
+
+  if (!user && !isPublicPath && !isApiPath) {
     // A fresh URL, not request.nextUrl.clone() - cloning carries over every
     // query param from the original request, including Next's internal
     // `_rsc=...` prefetch param, which would otherwise leak into the
@@ -59,6 +67,12 @@ export async function proxy(request) {
     const { data: profile } = await supabase.from("profiles").select("is_active").eq("id", user.id).single();
     if (profile && !profile.is_active) {
       await supabase.auth.signOut();
+      // Still enforced on /api/ - only the shape of the answer differs.
+      // Leaving API paths out of this check altogether would let a
+      // deactivated account keep calling them with its existing session.
+      if (isApiPath) {
+        return NextResponse.json({ error: "This account has been deactivated." }, { status: 401 });
+      }
       const url = new URL("/login", request.url);
       url.searchParams.set("deactivated", "1");
       return NextResponse.redirect(url);
