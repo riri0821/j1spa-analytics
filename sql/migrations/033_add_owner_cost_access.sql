@@ -37,6 +37,12 @@
 --  the opposite of additive. New owner_* functions instead, and 034 revokes
 --  the originals.
 --
+--  ALSO IN HERE, and not about cost: undo_sale and undo_service are
+--  recreated with the null-role guard the other five write RPCs already
+--  have. Same NULL bypass as the owner_* guards below, but on a write - see
+--  section 8 and 9 at the end of this file. Additive in the same sense:
+--  recreating a function body breaks nothing that was working.
+--
 --  SAFE TO RUN against real data. Run in a NEW query tab. Mirrored into
 --  sql/supabase_schema.sql.
 -- =====================================================================
@@ -454,6 +460,157 @@ $$;
 revoke execute on function owner_stockin_by_supplier(text) from public;
 revoke execute on function owner_stockin_by_supplier(text) from anon;
 grant execute on function owner_stockin_by_supplier(text) to authenticated, service_role;
+
+
+-- ---------------------------------------------------------------------
+--  8 and 9. undo_sale and undo_service: refuse a caller with no profile.
+--
+--  Both read
+--
+--    if v_role <> 'owner' and ( ...the staff restriction... ) then
+--
+--  and v_role comes from current_user_role(), which is NULL when there is
+--  no profile row for auth.uid(). `NULL <> 'owner'` is NULL, a plpgsql IF
+--  treats NULL as false, so for such a caller the whole condition is
+--  skipped and the staff restriction never applies: they could undo
+--  ANYONE's sale or service, from ANY date. These are writes, which makes
+--  this the more serious half of the same NULL bypass the owner_* guards
+--  above had.
+--
+--  Confirmed against the live database rather than read off the source, by
+--  web/scripts/check-staff-access.mjs: a signed-in caller whose profile row
+--  had been removed reached 'Sale not found.' and 'Service record not
+--  found.', which is only possible after passing the role logic.
+--
+--  The fix is the one the other five write RPCs already use - confirm_sale,
+--  edit_sale, record_service, set_product_supplier and
+--  record_stock_movements all raise on a null role immediately after the
+--  lookup. These two were the only ones that did not.
+--
+--  ONLY that guard changes. Everything else, the Manila date comparison
+--  from migration 031 included, is byte-identical to what
+--  supabase_schema.sql held.
+-- ---------------------------------------------------------------------
+
+create or replace function undo_sale(p_sale_id bigint)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_role user_role;
+  v_sale record;
+  v_item record;
+  v_new_bal integer;
+begin
+  if v_uid is null then
+    raise exception 'Not signed in.';
+  end if;
+  v_role := current_user_role();
+  -- A null role means there is no profile row for this account. Without
+  -- this, `v_role <> 'owner'` below evaluates to NULL, the IF is skipped,
+  -- and the staff restriction never applies - so the caller could undo
+  -- anyone's record from any date. The other write RPCs all raise here.
+  if v_role is null then
+    raise exception 'No profile found for this account.';
+  end if;
+
+  select * into v_sale from sales where sale_id = p_sale_id for update;
+  if not found then
+    raise exception 'Sale not found.';
+  end if;
+  if v_sale.status = 'voided' then
+    raise exception 'Already undone.';
+  end if;
+
+  -- staff may undo only their own sale on the same day; owner may undo any.
+  -- Manila, not UTC: a timestamptz cast to date uses the session's TimeZone,
+  -- which for PostgREST is UTC, and so is current_date - which put "the same
+  -- day" eight hours out of step with the trading day. See
+  -- sql/migrations/031_fix_audit_batch_1.sql.
+  if v_role <> 'owner' and (
+    v_sale.user_id is distinct from v_uid
+    or (v_sale.sale_ts at time zone 'Asia/Manila')::date
+       <> (now() at time zone 'Asia/Manila')::date
+  ) then
+    raise exception 'Not allowed to undo this sale.';
+  end if;
+
+  for v_item in select product_id, sku, quantity from sale_items where sale_id = p_sale_id
+  loop
+    update products set stock_on_hand = stock_on_hand + v_item.quantity
+      where product_id = v_item.product_id
+      returning stock_on_hand into v_new_bal;
+
+    insert into stock_movements (product_id, sku, movement_type, quantity,
+        balance_after, user_id, reference)
+    values (v_item.product_id, v_item.sku, 'void_increment', v_item.quantity,
+        v_new_bal, v_uid, 'undo:' || p_sale_id);
+  end loop;
+
+  update sales set status = 'voided', voided_ts = now() where sale_id = p_sale_id;
+
+  return jsonb_build_object('ok', true, 'sale_id', p_sale_id);
+end;
+$$;
+
+revoke execute on function undo_sale(bigint) from public;
+revoke execute on function undo_sale(bigint) from anon;
+grant execute on function undo_sale(bigint) to authenticated, service_role;
+
+create or replace function undo_service(p_service_id bigint)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_role user_role;
+  v_service record;
+begin
+  if v_uid is null then
+    raise exception 'Not signed in.';
+  end if;
+  v_role := current_user_role();
+  -- A null role means there is no profile row for this account. Without
+  -- this, `v_role <> 'owner'` below evaluates to NULL, the IF is skipped,
+  -- and the staff restriction never applies - so the caller could undo
+  -- anyone's record from any date. The other write RPCs all raise here.
+  if v_role is null then
+    raise exception 'No profile found for this account.';
+  end if;
+
+  select * into v_service from services where service_id = p_service_id for update;
+  if not found then
+    raise exception 'Service record not found.';
+  end if;
+  if v_service.status = 'voided' then
+    raise exception 'Already undone.';
+  end if;
+
+  -- staff may undo only their own record on the same day; owner may undo
+  -- any. Manila, not UTC - see undo_sale above, and
+  -- sql/migrations/031_fix_audit_batch_1.sql.
+  if v_role <> 'owner' and (
+    v_service.user_id is distinct from v_uid
+    or (v_service.service_ts at time zone 'Asia/Manila')::date
+       <> (now() at time zone 'Asia/Manila')::date
+  ) then
+    raise exception 'Not allowed to undo this service record.';
+  end if;
+
+  update services set status = 'voided', voided_ts = now() where service_id = p_service_id;
+
+  return jsonb_build_object('ok', true, 'service_id', p_service_id);
+end;
+$$;
+
+revoke execute on function undo_service(bigint) from public;
+revoke execute on function undo_service(bigint) from anon;
+grant execute on function undo_service(bigint) to authenticated, service_role;
 
 
 -- ---------------------------------------------------------------------

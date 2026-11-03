@@ -592,6 +592,13 @@ begin
     raise exception 'Not signed in.';
   end if;
   v_role := current_user_role();
+  -- A null role means there is no profile row for this account. Without
+  -- this, `v_role <> 'owner'` below evaluates to NULL, the IF is skipped,
+  -- and the staff restriction never applies - so the caller could undo
+  -- anyone's record from any date. The other write RPCs all raise here.
+  if v_role is null then
+    raise exception 'No profile found for this account.';
+  end if;
 
   select * into v_sale from sales where sale_id = p_sale_id for update;
   if not found then
@@ -841,6 +848,13 @@ begin
     raise exception 'Not signed in.';
   end if;
   v_role := current_user_role();
+  -- A null role means there is no profile row for this account. Without
+  -- this, `v_role <> 'owner'` below evaluates to NULL, the IF is skipped,
+  -- and the staff restriction never applies - so the caller could undo
+  -- anyone's record from any date. The other write RPCs all raise here.
+  if v_role is null then
+    raise exception 'No profile found for this account.';
+  end if;
 
   select * into v_service from services where service_id = p_service_id for update;
   if not found then

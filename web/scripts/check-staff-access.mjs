@@ -24,6 +24,11 @@
  * cost reads are expected to SUCCEED, and a failure there means something
  * else is wrong. --expect=after is the real gate.
  *
+ * The no-profile group is different: it is about migration 033, not 034, so
+ * it must pass in BOTH modes once 033 is applied. Before that it reports the
+ * owner_* functions as missing and both undo RPCs as FAIL, which is accurate
+ * - that is the bypass 033 closes.
+ *
  * Writes nothing except the temporary user. Exits 1 if any check fails.
  */
 import { createAnonClient, createServiceClient } from "./lib/db.mjs";
@@ -255,24 +260,33 @@ try {
         ]) {
           await probe("No-profile caller", label, "denied", call);
         }
-        // The write RPCs that guard on v_role have the same shape. undo_sale
-        // and undo_service are reported here because they read `v_role <>
-        // 'owner'` with no preceding null check, so a caller in this state
-        // skips the staff restriction entirely. Probed with an id that does
-        // not exist, so nothing can be written either way: "Sale not found."
-        // means it got past the role logic, which is the finding.
+        // undo_sale and undo_service read `v_role <> 'owner'`, which is NULL
+        // for this caller, so before 033 the IF was skipped and the staff
+        // restriction never applied: they could undo anyone's record from
+        // any date. 033 adds the null-role guard the other five write RPCs
+        // already had, so both must now refuse with "No profile found for
+        // this account."
+        //
+        // Probed with an id that cannot exist, so nothing is written either
+        // way - and that is also what makes the result readable. "Sale not
+        // found." is a FAIL: reaching the row lookup at all means the guard
+        // did not fire. Anything mentioning a missing profile is the guard
+        // working.
         for (const [label, call] of [
-          ["undo_sale() reaches the role check", () => ghostClient.rpc("undo_sale", { p_sale_id: -1 })],
-          ["undo_service() reaches the role check", () => ghostClient.rpc("undo_service", { p_service_id: -1 })],
+          ["undo_sale() refuses a caller with no profile", () => ghostClient.rpc("undo_sale", { p_sale_id: -1 })],
+          ["undo_service() refuses a caller with no profile", () => ghostClient.rpc("undo_service", { p_service_id: -1 })],
         ]) {
           const { error } = await call();
           const message = error?.message ?? "";
-          const stoppedEarly = /not signed in|no profile found/i.test(message);
+          const guarded = /no profile found|not signed in/i.test(message);
+          const gotPastTheGuard = /not found/i.test(message) && !guarded;
           record(
             "No-profile caller",
             label,
-            stoppedEarly ? "PASS" : "NOTE",
-            message ? `"${message.slice(0, 70)}"` : "no error"
+            guarded ? "PASS" : "FAIL",
+            message
+              ? `"${message.slice(0, 70)}"${gotPastTheGuard ? "  <- past the role logic: 033 is not applied" : ""}`
+              : "no error at all, which a missing id should have produced"
           );
         }
       }
@@ -330,7 +344,7 @@ try {
           : group === "Owner-only functions"
             ? "must be DENIED in both modes - the check is inside the function"
             : group === "No-profile caller"
-              ? "current_user_role() is NULL here: every owner_* function must still DENY"
+              ? "current_user_role() is NULL here: every owner_* function, and both undo RPCs, must DENY"
               : "must be ALLOWED in both modes";
     console.log(`  ${want}\n`);
     for (const r of results.filter((x) => x.group === group)) {
@@ -340,7 +354,6 @@ try {
 
   const failed = results.filter((r) => r.outcome === "FAIL");
   const skipped = results.filter((r) => r.outcome === "SKIP");
-  const notes = results.filter((r) => r.outcome === "NOTE");
   section(failed.length === 0 ? "All checks passed" : `${failed.length} CHECK(S) FAILED`);
   if (skipped.length > 0) {
     console.log(`  ${skipped.length} skipped, nothing to conclude from:`);
@@ -350,17 +363,17 @@ try {
     console.log("");
   }
   for (const r of failed) console.log(`  FAIL  ${r.label}: ${r.detail}`);
-  if (notes.length > 0) {
-    console.log(`  ${notes.length} noted, not scored - a finding about code this branch does not change:`);
-    for (const r of notes) console.log(`    ${r.label}  ${r.detail}`);
-    console.log("    undo_sale and undo_service compare `v_role <> 'owner'` with no null");
-    console.log("    check first, so a caller with no profile row skips the staff");
-    console.log("    restriction. Fix: add `if v_role is null then raise` as the other");
-    console.log("    write RPCs do, or use `is distinct from`.");
-  }
-  if (!AFTER && failed.length === 0) {
+  if (!AFTER) {
+    const only033 = failed.length > 0 && failed.every((r) => r.group === "No-profile caller");
     console.log("  This is the BEFORE picture. The cost reads succeeding is the hole that");
     console.log("  migration 034 closes; re-run with --expect=after once it is applied.");
+    if (only033) {
+      console.log("");
+      console.log("  The failures above are all in the no-profile group, which is about");
+      console.log("  migration 033 rather than 034. They are expected to fail until 033 is");
+      console.log("  run, and are the reason it needs running: a signed-in caller with no");
+      console.log("  profile row currently passes straight through undo_sale's role check.");
+    }
   }
   process.exitCode = failed.length ? 1 : 0;
 } catch (err) {
