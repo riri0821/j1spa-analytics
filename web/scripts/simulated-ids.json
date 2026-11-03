@@ -39,6 +39,28 @@
       "stockMovements": {
         "count": 1719
       }
+    },
+    {
+      "generatedAt": "2026-11-03T11:00:04.744Z",
+      "note": "simulated",
+      "mode": "cleanup-restock",
+      "why": "one stock_in per product whose chain would have gone negative once the hand-entered test rows were removed",
+      "stockMovements": [
+        {
+          "movement_id": 279390,
+          "sku": "J1-0044",
+          "product_id": 625,
+          "movement_ts": "2026-10-15T03:15:47.000Z",
+          "quantity": 10
+        },
+        {
+          "movement_id": 279391,
+          "sku": "J1-0283",
+          "product_id": 864,
+          "movement_ts": "2026-10-17T02:15:40.000Z",
+          "quantity": 8
+        }
+      ]
     }
   ],
   "howToRemove": [

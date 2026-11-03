@@ -124,9 +124,16 @@ web/                        the live application
     simulate-recent-activity.mjs  tops up sales/services from the last recorded
                                 event to now, or fills an earlier window with
                                 --from/--to
-    cleanup-test-data.mjs      finds the hand-entered test rows and plans their
-                                removal, recomputing every affected ledger chain
-    simulated-ids.json         the id ranges each simulation run inserted
+    cleanup-test-data.mjs      finds the hand-entered test rows and removes them,
+                                recomputing every affected ledger chain; backs up
+                                first and verifies the backup before writing
+    restore-test-data-cleanup.mjs  undoes that cleanup from its backup file
+    verify-gapfill.mjs,
+    verify-cleanup.mjs         read-only checks that each of those did what it
+                                said: chains consistent, no negative balances,
+                                totals as expected
+    simulated-ids.json         the id ranges each run inserted
+    backups/                   local only, gitignored: whole customer rows
 
 forecast-service/            FastAPI microservice: SMA / WMA / Linear Regression /
                               ARIMA / Holt-Winters, rolling backtest + model
@@ -283,10 +290,66 @@ both tag their rows so they can be told apart from anything genuine.
 | Seed sales + the ledger backfill | 1 Jan 2020, 08:35 → 30 Sep 2026, 17:50 | `stock_movements.note = 'seed-backfill'` |
 | `simulate-recent-activity.mjs` | 8 Oct 2026 → the last run | `note = 'simulated'` on sales and movements; service id ranges in `web/scripts/simulated-ids.json` |
 | The same script in gap mode (`--from`/`--to`) | 1 to 6 Oct 2026 | the same tags. Added to fill the window between the seed's end and the simulated month, which read as a demand dip |
-| Hand-entered test sales | 30 Sep (evening), 3-6 Oct 2026 | none. Ten sales entered through the app, all outside 08:00-18:00 trading hours. One carries `note = 'a'` |
+| Hand-entered test rows | 30 Sep to 6 Oct 2026 | **removed on 3 Nov 2026**, see below |
 
 `web/scripts/simulated-ids.json` records every simulation run: the window it covered
 and the exact `sales` / `services` id ranges it inserted, plus a `howToRemove` list.
+
+### The hand-entered test data has been removed
+
+Testing the app by hand left rows that carried no tag at all, so they could
+only be found by evidence: untagged and dated after the seed's last sale
+(30 Sep 2026, 17:50 Manila). `scripts/cleanup-test-data.mjs` found and removed
+them on **3 November 2026**:
+
+| | |
+| --- | --- |
+| 8 sales | `sale_id` 1 and 2 on the evening of 30 Sep, and 156467 to 156472 on 3-6 Oct. One carried `note = 'a'`, one the brand `'tagpe'` |
+| 16 sale_items | theirs, plus the test product's |
+| 25 stock_movements | their decrements, the stock-ins entered by hand at 19:48-20:27, and the test product's whole chain |
+| 2 services | `'wash'` and `'brake'`, neither on the agreed list |
+| 1 product | SKU `123` ("aaa"), inactive, outside the `J1-####` pattern |
+
+Removing them shifted 80 `balance_after` values and 8 `stock_on_hand` figures,
+because deleting a movement moves every later balance in that product's chain.
+Two products, J1-0044 and J1-0283, would have gone negative: the hand-entered
+stock-ins had supplied units that later simulated sales already consumed. Each
+got one `stock_in` tagged `'simulated'`, placed just before the row that would
+have gone negative and sized by the simulation's own delivery rule (10 and 8
+units), with the product's own supplier and unit cost. Their ids are in
+`simulated-ids.json` under `mode: "cleanup-restock"`.
+
+Active stock went from 3,856 to **3,867**, which is the dry run's 3,849 plus
+those 18 units. Every one of the 576 products' chains still walks end to end
+and ends at its `stock_on_hand`, with no negative balance anywhere across
+279,362 movements.
+
+### Backups, and putting it back
+
+`scripts/cleanup-test-data.mjs` writes a full backup before it touches a row,
+reads it back off disk, and checks it against the plan table by table and id
+by id. It refuses to write if anything does not match.
+
+```bash
+cd web
+node scripts/cleanup-test-data.mjs                  # dry run, the default
+node scripts/cleanup-test-data.mjs --backup-only    # write and verify the backup, change nothing
+node scripts/cleanup-test-data.mjs --apply
+node scripts/verify-cleanup.mjs <backup.json> --expect-stock 3867
+node scripts/restore-test-data-cleanup.mjs <backup.json>   # dry run; --apply to undo
+```
+
+**`web/scripts/backups/` is gitignored and must stay that way.** It holds
+whole customer rows, including names, contact numbers and addresses.
+
+The restore puts back the overwritten `balance_after` and `stock_on_hand`
+values directly and deletes the rescue restocks, but it cannot re-insert a
+deleted row on its own: every id column here is
+`bigint generated always as identity`, and Postgres needs
+`overriding system value` to accept an explicit one, which PostgREST cannot
+express. So it prints that SQL instead, ready to paste. Restoring with fresh
+ids would be worse than useless, because `sale_items.sale_id` and
+`stock_movements.reference` both point at the originals.
 
 ### Topping it up
 
@@ -319,9 +382,8 @@ delete from sales where note = 'simulated';
 delete from services where service_id between <first> and <last>;
 ```
 
-`web/scripts/cleanup-test-data.mjs` does the same job for the hand-entered test rows,
-which carry no tag at all: it finds them, recomputes every affected ledger chain and
-prints the backup SQL to run first (dry run by default).
+The hand-entered rows are already gone, with a backup kept locally, as described
+above.
 
 Then restore `products.stock_on_hand` from the `backup` schema, or recompute it from
 the remaining ledger. Dropping the seed history as well means also deleting

@@ -296,3 +296,91 @@ export function backupPrecondition(expected, actual) {
   }
   return { ok: problems.length === 0, problems };
 }
+
+/**
+ * Where to put one delivery so a post-deletion chain never goes negative.
+ *
+ * Placed immediately before the first row that would take the balance below
+ * zero, which is where a real delivery would have had to arrive. Sized by the
+ * caller's own rule rather than at the bare deficit, so it looks like the
+ * shop's other deliveries; whatever that rule returns is raised to at least
+ * the deficit, because the lowest point of the chain may come later than the
+ * first negative one and the whole tail lifts by the amount delivered.
+ *
+ * @param kept the surviving rows in time order, each { movement_id,
+ *   movement_ts, quantity }.
+ * @param opening the balance the chain starts from.
+ * @param size ({ have, deficit }) -> qty, the caller's sizing rule.
+ * @returns null when nothing is needed, else { ts, qty, deficit, have,
+ *   beforeMovementId }.
+ */
+export function planRestockFix({ kept, opening, size }) {
+  let balance = opening;
+  let min = opening;
+  let firstNegativeIdx = -1;
+  let haveBefore = opening;
+
+  kept.forEach((m, i) => {
+    const before = balance;
+    balance += m.quantity;
+    if (balance < min) min = balance;
+    if (balance < 0 && firstNegativeIdx === -1) {
+      firstNegativeIdx = i;
+      haveBefore = before;
+    }
+  });
+
+  if (min >= 0) return null;
+
+  const deficit = -min;
+  const qty = Math.max(size({ have: haveBefore, deficit }), deficit);
+  const target = kept[firstNegativeIdx];
+  return {
+    beforeMovementId: target.movement_id,
+    // A minute ahead of the row it rescues: close enough to read as the
+    // delivery that made that sale possible, and ordered before it.
+    ts: target.movement_ts - 60_000,
+    qty,
+    deficit,
+    have: haveBefore,
+  };
+}
+
+/**
+ * Check a backup read back off disk against the plan that produced it.
+ *
+ * The point is to catch a backup that is short or stale BEFORE anything is
+ * deleted, which means comparing ids rather than counts alone: two sets can
+ * be the same size and hold different rows.
+ *
+ * @param plan { deletes: { table: [ids] }, updates: { table: [ids] } }
+ * @param backup the same shape, read back from the file.
+ */
+export function verifyBackupFile(plan, backup) {
+  const problems = [];
+  const sameIds = (kind, name, want, got) => {
+    if (!got) {
+      problems.push(`${kind}.${name}: missing from the backup (expected ${want.length} rows)`);
+      return;
+    }
+    if (got.length !== want.length) {
+      problems.push(`${kind}.${name}: backup holds ${got.length} rows, plan has ${want.length}`);
+      return;
+    }
+    const a = [...want].sort((x, y) => x - y).join(",");
+    const b = [...got].sort((x, y) => x - y).join(",");
+    if (a !== b) problems.push(`${kind}.${name}: the ids differ, so the backup is not of this plan`);
+  };
+
+  for (const [name, ids] of Object.entries(plan.deletes ?? {})) {
+    sameIds("deletes", name, ids, backup.deletes?.[name]);
+  }
+  for (const [name, ids] of Object.entries(plan.updates ?? {})) {
+    sameIds("updates", name, ids, backup.updates?.[name]);
+  }
+  for (const name of Object.keys(backup.deletes ?? {})) {
+    if (!(name in (plan.deletes ?? {}))) problems.push(`deletes.${name}: in the backup but not in the plan`);
+  }
+
+  return { ok: problems.length === 0, problems };
+}

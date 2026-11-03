@@ -21,10 +21,12 @@ import {
   countRewrittenRows,
   planProductWindow,
   planWindowDeliveries,
+  planRestockFix,
   rechainAfterDeletions,
   rechainAfterWindow,
   rechainWindow,
   splitAroundWindow,
+  verifyBackupFile,
 } from "./lib/gapFill.mjs";
 
 let passed = 0;
@@ -804,6 +806,122 @@ const HISTORY = [
   is("a backup that does not match exactly is refused", over.ok, false);
 
   is("nothing to back up needs no backup", backupPrecondition({}, {}).ok, true);
+}
+
+// ------------------- cleanup: the restock that rescues a negative chain
+//
+// Removing a hand-entered stock-in takes away units that later sales have
+// already consumed, so two products' chains go negative. The fix is one
+// delivery placed where a real one would have had to arrive, sized like the
+// shop's others rather than at the bare deficit.
+
+{
+  // Opening 0, a +10 stock-in removed, so the sales that followed it have
+  // nothing behind them.
+  const kept = [
+    { movement_id: 100, movement_ts: 10_000, quantity: -4 },
+    { movement_id: 101, movement_ts: 20_000, quantity: -6 },
+    { movement_id: 102, movement_ts: 30_000, quantity: 2 },
+  ];
+
+  const bare = planRestockFix({ kept, opening: 0, size: ({ deficit }) => deficit });
+  is("placed just before the first row that goes negative", bare.beforeMovementId, 100);
+  is("a minute ahead of it", bare.ts, 10_000 - 60_000);
+  is("the deficit is the chain's lowest point, not the first dip", bare.deficit, 10);
+  is("and the balance it would have had", bare.have, 0);
+
+  // A sizing rule that asks for less than the deficit is raised to it.
+  const stingy = planRestockFix({ kept, opening: 0, size: () => 1 });
+  is("a size below the deficit is raised to the deficit", stingy.qty, 10);
+
+  // A realistic rule asks for more, and that is kept.
+  const generous = planRestockFix({ kept, opening: 0, size: ({ have, deficit }) => deficit - have + 15 });
+  is("a larger realistic size is kept", generous.qty, 25);
+
+  // Inserting it has to leave the whole chain non-negative.
+  for (const fix of [bare, stingy, generous]) {
+    const walked = rechainWindow({
+      opening: 0,
+      rows: [
+        { movement_ts: fix.ts, quantity: fix.qty },
+        ...kept.map((m) => ({ ...m, balance_after: undefined })),
+      ],
+    });
+    ok(`a fix of ${fix.qty} leaves no negative balance`, walked.minBalance >= 0, `min ${walked.minBalance}`);
+  }
+
+  // A chain that never goes negative needs no fix at all.
+  is("a healthy chain needs no restock",
+    planRestockFix({
+      kept: [{ movement_id: 1, movement_ts: 1, quantity: -1 }],
+      opening: 5,
+      size: ({ deficit }) => deficit,
+    }),
+    null);
+
+  // The lowest point AFTER the first negative one is what sets the size:
+  // a fix sized on the first dip alone would leave the tail negative.
+  const deepLater = [
+    { movement_id: 1, movement_ts: 10, quantity: -1 },
+    { movement_id: 2, movement_ts: 20, quantity: -8 },
+  ];
+  const deep = planRestockFix({ kept: deepLater, opening: 0, size: ({ deficit }) => deficit });
+  is("the size covers the deepest point, not the first", deep.deficit, 9);
+  const deepWalk = rechainWindow({
+    opening: 0,
+    rows: [{ movement_ts: deep.ts, quantity: deep.qty }, ...deepLater],
+  });
+  ok("so the tail stays non-negative too", deepWalk.minBalance >= 0, `min ${deepWalk.minBalance}`);
+}
+
+// ------------------------- cleanup: verifying the backup file on disk
+//
+// The backup is written, then read back and checked against the plan before
+// a single row is deleted. Counts alone are not enough: two sets can be the
+// same size and hold different rows.
+
+{
+  const plan = {
+    deletes: { sales: [1, 2, 156467], stock_movements: [8, 9, 10], services: [1, 2] },
+    updates: { stock_movements: [271447, 272256], products: [582, 583] },
+  };
+
+  is("a backup of this plan passes", verifyBackupFile(plan, JSON.parse(JSON.stringify(plan))).ok, true);
+  is("order does not matter",
+    verifyBackupFile(plan, { deletes: { sales: [156467, 1, 2], stock_movements: [10, 9, 8], services: [2, 1] }, updates: plan.updates }).ok,
+    true);
+
+  const short = verifyBackupFile(plan, {
+    deletes: { ...plan.deletes, sales: [1, 2] },
+    updates: plan.updates,
+  });
+  is("a short backup is refused", short.ok, false);
+  ok("with both counts", short.problems.some((x) => x.includes("2 rows") && x.includes("3")), short.problems.join("; "));
+
+  // Same count, different rows: the case a count check would wave through.
+  const swapped = verifyBackupFile(plan, {
+    deletes: { ...plan.deletes, sales: [1, 2, 999999] },
+    updates: plan.updates,
+  });
+  is("a same-size backup of different rows is refused", swapped.ok, false);
+  ok("and says the ids differ", swapped.problems.some((x) => x.includes("ids differ")), swapped.problems.join("; "));
+
+  const missingTable = verifyBackupFile(plan, { deletes: { sales: [1, 2, 156467], stock_movements: [8, 9, 10] }, updates: plan.updates });
+  is("a missing table is refused", missingTable.ok, false);
+  ok("and is named", missingTable.problems.some((x) => x.includes("services")), missingTable.problems.join("; "));
+
+  const missingUpdates = verifyBackupFile(plan, { deletes: plan.deletes, updates: { stock_movements: [271447, 272256] } });
+  is("missing update rows are refused too", missingUpdates.ok, false);
+
+  // A backup covering MORE than the plan is also refused: it was taken
+  // against different data.
+  const extra = verifyBackupFile(plan, {
+    deletes: { ...plan.deletes, alerts: [7] },
+    updates: plan.updates,
+  });
+  is("a backup with an extra table is refused", extra.ok, false);
+
+  is("an empty plan needs an empty backup", verifyBackupFile({ deletes: {}, updates: {} }, { deletes: {}, updates: {} }).ok, true);
 }
 
 // ------------------------------------------------------------------- done

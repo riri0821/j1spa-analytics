@@ -42,3 +42,7 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local-only backups written by scripts/cleanup-test-data.mjs. These hold
+# real customer rows and must never be committed.
+scripts/backups/

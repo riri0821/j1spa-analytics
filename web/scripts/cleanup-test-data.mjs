@@ -22,11 +22,27 @@
  *
  * Profiles are listed and never touched.
  */
-import { createServiceClient, pageAll, probePageSize, progressDone, progressLine } from "./lib/db.mjs";
-import { backupPrecondition, rechainAfterDeletions } from "./lib/gapFill.mjs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import {
+  WEB_DIR,
+  createServiceClient,
+  insertBatched,
+  pageAll,
+  probePageSize,
+  progressDone,
+  progressLine,
+} from "./lib/db.mjs";
+import { planRestockFix, rechainAfterDeletions, rechainWindow, verifyBackupFile } from "./lib/gapFill.mjs";
+import {
+  BUFFER_MAX_DAYS,
+  LEAD_MAX_DAYS,
+  planDelivery,
+} from "./simulate-recent-activity.mjs";
 import {
   STORE_CLOSE_HOUR,
   STORE_OPEN_HOUR,
+  deliveryReceipt,
   fmtInt,
   fmtPeso,
   manilaDateString,
@@ -38,8 +54,16 @@ import {
 
 const argv = process.argv.slice(2);
 const APPLY = argv.includes("--apply");
+// Write and verify the backup without touching a row. This is what makes the
+// restore testable before the cleanup runs: with the database still intact,
+// a restore dry run against the file should find nothing to do, which is the
+// proof that the file is a faithful snapshot.
+const BACKUP_ONLY = argv.includes("--backup-only");
 const TODAY = manilaDateString(Date.now()).replace(/-/g, "");
 const BACKUP_PREFIX = `backup.cleanup_${TODAY}`;
+const BACKUP_DIR = resolve(WEB_DIR, "scripts", "backups");
+const IDS_FILE = resolve(WEB_DIR, "scripts", "simulated-ids.json");
+const SIMULATED_NOTE = "simulated";
 
 const cols = (...labels) => labels.map((label, i) => ({ label, get: (r) => r[i] }));
 const SKU_PATTERN = /^J1-\d{4}$/;
@@ -63,15 +87,33 @@ async function main() {
   section(`Clean up hand-entered test data${APPLY ? " -- APPLY" : " -- DRY RUN (no writes)"}`);
 
   // ------------------------------------------------------------------ load
+  // Products first, and only then the alerts/overrides that reference the
+  // test product. Loading the whole alerts table was timing out server-side
+  // and is unnecessary: nothing else about it matters here.
+  progressLine("loading products...");
+  const products = await pageAll(
+    () => sb
+      .from("products")
+      // supplier and unit_cost are here for the rescue restocks, which carry
+      // the product's own values the way a real delivery does.
+      .select("product_id, sku, name, is_active, stock_on_hand, reorder_point, supplier, unit_cost")
+      .order("product_id"),
+    { pageSize, label: "products" }
+  );
+  const testProductIdsEarly = products.filter((p) => !SKU_PATTERN.test(p.sku)).map((p) => p.product_id);
+
   progressLine("loading...");
-  const [products, sales, items, movements, services, alerts, overrides, profiles] = await Promise.all([
-    pageAll(() => sb.from("products").select("product_id, sku, name, is_active, stock_on_hand, reorder_point").order("product_id"), { pageSize, label: "products" }),
+  const [sales, items, movements, services, alerts, overrides, profiles] = await Promise.all([
     pageAll(() => sb.from("sales").select("sale_id, sale_ts, status, note, total_amount, customer_name, customer_vehicle_brand, user_id").order("sale_id"), { pageSize, label: "sales" }),
     pageAll(() => sb.from("sale_items").select("sale_item_id, sale_id, product_id, sku, quantity, line_revenue").order("sale_item_id"), { pageSize, label: "sale_items" }),
     pageAll(() => sb.from("stock_movements").select("movement_id, product_id, sku, movement_ts, movement_type, quantity, balance_after, reference, note").order("movement_id"), { pageSize, label: "movements" }),
     pageAll(() => sb.from("services").select("service_id, service_ts, service_type, status, total_amount, customer_vehicle_brand").order("service_id"), { pageSize, label: "services" }),
-    pageAll(() => sb.from("alerts").select("alert_id, product_id, sku, batch_id").order("alert_id"), { pageSize, label: "alerts" }),
-    pageAll(() => sb.from("advisory_overrides").select("product_id, manual_type").order("product_id"), { pageSize, label: "overrides" }),
+    testProductIdsEarly.length
+      ? pageAll(() => sb.from("alerts").select("alert_id, product_id, sku, batch_id").in("product_id", testProductIdsEarly).order("alert_id"), { pageSize, label: "alerts" })
+      : Promise.resolve([]),
+    testProductIdsEarly.length
+      ? pageAll(() => sb.from("advisory_overrides").select("product_id, manual_type").in("product_id", testProductIdsEarly).order("product_id"), { pageSize, label: "overrides" })
+      : Promise.resolve([]),
     pageAll(() => sb.from("profiles").select("id, username, full_name, role, is_active").order("username"), { pageSize, label: "profiles" }),
   ]);
   progressDone(
@@ -224,7 +266,20 @@ async function main() {
     movementsByProduct.get(m.product_id).push({ ...m, movement_ts: Date.parse(m.movement_ts) });
   }
 
+  // Units a day per product over the last eight weeks of recorded sales, so
+  // a rescue delivery can be sized the way the simulation sizes its own.
+  const DEMAND_WINDOW_DAYS = 56;
+  const demandSince = Date.now() - DEMAND_WINDOW_DAYS * 86400_000;
+  const saleTs = new Map(sales.map((x) => [x.sale_id, Date.parse(x.sale_ts)]));
+  const dailyDemand = new Map();
+  for (const i of items) {
+    const ts = saleTs.get(i.sale_id);
+    if (ts == null || ts < demandSince) continue;
+    dailyDemand.set(i.product_id, (dailyDemand.get(i.product_id) ?? 0) + Number(i.quantity) / DEMAND_WINDOW_DAYS);
+  }
+
   const affected = [...new Set(testMovements.map((m) => m.product_id))];
+  const restockFixes = [];
   const perProduct = [];
   const balanceUpdates = [];
   const stockUpdates = [];
@@ -235,38 +290,87 @@ async function main() {
     const chain = movementsByProduct.get(productId) ?? [];
     const result = rechainAfterDeletions({ movements: chain, deletedIds: testMovementIds });
 
+    let final = result;
+    let fix = null;
+
     if (result.minBalance < 0) {
-      // The smallest honest fix, rather than dropping rows to force it.
-      const shortfall = -result.minBalance;
-      conflicts.push({
-        sku: product.sku,
-        minBalance: result.minBalance,
-        shortfall,
-        proposal:
-          `insert one simulated stock_in of ${shortfall} for ${product.sku} just before the first ` +
-          `row that goes negative, then rewalk. Do not drop rows to make it fit.`,
+      // One delivery, where a real one would have had to arrive, sized the
+      // way the simulation sizes this product's deliveries rather than at
+      // the bare deficit. Dropping rows to make the arithmetic fit would be
+      // falsifying the history this is meant to clean.
+      fix = planRestockFix({
+        kept: result.kept,
+        opening: result.opening,
+        size: ({ have, deficit }) => {
+          const order = planDelivery({
+            have,
+            dailyDemand: dailyDemand.get(productId) ?? 0,
+            reorderPoint: product.reorder_point ?? 0,
+            lead: LEAD_MAX_DAYS,
+            buffer: BUFFER_MAX_DAYS,
+            maxLineQty: 3,
+          });
+          return Math.max(order?.qty ?? 0, deficit);
+        },
       });
+
+      // Rewalk with the fix in place, so the numbers reported are the ones
+      // that would actually be stored.
+      const walked = rechainWindow({
+        opening: result.opening,
+        rows: [
+          { movement_ts: fix.ts, quantity: fix.qty },
+          ...result.kept.map((m) => ({ movement_id: m.movement_id, movement_ts: m.movement_ts, quantity: m.quantity, balance_after: m.balance_after })),
+        ],
+      });
+      final = {
+        updates: walked.rows
+          .filter((r) => r.movement_id != null && r.balance_after !== r.previousBalanceAfter)
+          .map((r) => ({ movement_id: r.movement_id, previousBalanceAfter: r.previousBalanceAfter, balance_after: r.balance_after })),
+        closing: walked.closing,
+        minBalance: walked.minBalance,
+        kept: result.kept,
+        opening: result.opening,
+      };
+      restockFixes.push({
+        product_id: productId,
+        sku: product.sku,
+        quantity: fix.qty,
+        deficit: fix.deficit,
+        beforeMovementId: fix.beforeMovementId,
+        movement_ts: new Date(fix.ts).toISOString(),
+        __ts: fix.ts,
+        balance_after: walked.rows.find((r) => r.movement_id == null).balance_after,
+        supplier: product.supplier ?? null,
+        unit_cost: product.unit_cost ?? null,
+        note: SIMULATED_NOTE,
+      });
+      if (final.minBalance < 0) {
+        conflicts.push({ sku: product.sku, minBalance: final.minBalance, note: "still negative after the fix" });
+      }
     }
 
-    balanceUpdates.push(...result.updates.map((u) => ({ ...u, sku: product.sku })));
-    if (result.closing !== product.stock_on_hand) {
+    balanceUpdates.push(...final.updates.map((u) => ({ ...u, sku: product.sku })));
+    if (final.closing !== product.stock_on_hand) {
       stockUpdates.push({
         product_id: productId,
         sku: product.sku,
         previous: product.stock_on_hand,
-        next: result.closing,
+        next: final.closing,
       });
     }
     perProduct.push({
+      productId,
       sku: product.sku,
       removed: chain.filter((m) => testMovementIds.has(m.movement_id)).length,
       stockBefore: product.stock_on_hand,
-      stockAfter: result.closing,
-      minBalance: result.minBalance,
-      rewritten: result.updates.length,
+      stockAfter: final.closing,
+      minBalance: final.minBalance,
+      rewritten: final.updates.length,
+      fix,
       chain,
-      kept: result.kept,
-      updates: result.updates,
+      kept: final.kept,
+      updates: final.updates,
     });
   }
 
@@ -300,6 +404,13 @@ async function main() {
   console.log("");
   table(
     [
+      ["stock_movements (rescue restocks)", fmtInt(restockFixes.length)],
+    ],
+    cols("insert into", "rows")
+  );
+  console.log("");
+  table(
+    [
       ["stock_movements.balance_after", fmtInt(balanceUpdates.length)],
       ["products.stock_on_hand", fmtInt(stockUpdates.length)],
       ["sales.customer_vehicle_brand -> NULL", fmtInt(tagpeToBlank.length)],
@@ -329,14 +440,30 @@ async function main() {
   console.log("");
   console.log(`  products affected: ${fmtInt(affected.length)}`);
 
-  section("7. Negative-balance conflicts");
-  if (conflicts.length === 0) {
-    console.log("  None. Every affected chain stays at or above zero throughout.");
+  section("7. Negative balances, and the restocks that fix them");
+  if (restockFixes.length === 0) {
+    console.log("  No chain went negative, so no restock was needed.");
   } else {
-    for (const c of conflicts) {
-      console.log(`  ${c.sku}: lowest balance would be ${c.minBalance} (short by ${c.shortfall})`);
-      console.log(`    proposal: ${c.proposal}`);
-    }
+    table(
+      restockFixes.map((f) => [
+        f.sku,
+        String(f.deficit),
+        String(f.quantity),
+        manilaStamp(f.__ts),
+        `before movement ${f.beforeMovementId}`,
+        String(f.balance_after),
+      ]),
+      cols("sku", "short by", "delivered", "when (Manila)", "placed", "balance after")
+    );
+    console.log("");
+    console.log("  One stock_in each, tagged 'simulated', with the product's own supplier");
+    console.log("  and unit_cost, placed a minute before the row that would have gone");
+    console.log("  negative. Sized by the simulation's own delivery rule for that product,");
+    console.log("  not at the bare deficit, so it reads like the shop's other deliveries.");
+  }
+  if (conflicts.length > 0) {
+    console.log("");
+    for (const c of conflicts) console.log(`  ! ${c.sku}: ${c.note} (${c.minBalance})`);
   }
 
   section("8. Effect on September and October gross");
@@ -396,12 +523,20 @@ async function main() {
   }
 
   // ------------------------------------------------------------- backup SQL
-  section("10. Backup SQL - run this in the Supabase editor FIRST");
-  console.log("  --apply refuses unless every one of these tables exists and its row count");
-  console.log("  matches the plan above exactly. A short backup is worse than none.");
+  const sqlLines = [];
+  const sql = (line = "") => {
+    sqlLines.push(line);
+    console.log(line === "" ? "" : `  ${line}`);
+  };
+
+  section("10. Backup SQL - optional extra, written to scripts/backups/");
+  console.log("  --apply does not use these: it writes a local JSON backup and verifies");
+  console.log("  that instead, because the `backup` schema is not reachable through");
+  console.log("  PostgREST. They are written to scripts/backups/cleanup-backup.sql as a");
+  console.log("  second copy you can run in the editor if you prefer one in the database.");
   console.log("");
-  console.log("    create schema if not exists backup;");
-  console.log("");
+  sql("create schema if not exists backup;");
+  sql();
   const idList = (xs) => xs.join(", ");
   const blocks = [
     [`${BACKUP_PREFIX}_sales`, "sales", `sale_id in (${idList([...testSaleIds])})`],
@@ -414,33 +549,27 @@ async function main() {
   ];
   for (const [name, src, where] of blocks) {
     if (/in \(\)/.test(where)) {
-      console.log(`    -- ${name}: nothing to back up (0 rows)`);
+      sql(`-- ${name}: nothing to back up (0 rows)`);
       continue;
     }
-    console.log(`    create table ${name} as`);
-    console.log(`    select * from ${src} where ${where};`);
-    console.log("");
+    sql(`create table ${name} as`);
+    sql(`select * from ${src} where ${where};`);
+    sql();
   }
-  console.log("");
-  console.log("  The rows this would UPDATE rather than delete need covering too, because");
-  console.log("  their balance_after and stock_on_hand are rewritten in place. Printed in");
-  console.log("  full, not truncated: an id list with an ellipsis in it is not runnable.");
-  console.log("");
-  // Wrapped at a readable width rather than one id per line or one long line.
   const wrapped = (ids) => {
     const out = [];
-    for (let i = 0; i < ids.length; i += 16) out.push(`      ${idList(ids.slice(i, i + 16))}${i + 16 < ids.length ? "," : ""}`);
+    for (let i = 0; i < ids.length; i += 16) out.push(`  ${idList(ids.slice(i, i + 16))}${i + 16 < ids.length ? "," : ""}`);
     return out;
   };
-  console.log(`    create table ${BACKUP_PREFIX}_movements_rebalanced as`);
-  console.log(`    select * from stock_movements where movement_id in (`);
-  for (const line of wrapped(balanceUpdates.map((u) => u.movement_id).sort((a, b) => a - b))) console.log(line);
-  console.log(`    );  -- ${fmtInt(balanceUpdates.length)} rows`);
-  console.log("");
-  console.log(`    create table ${BACKUP_PREFIX}_products_restocked as`);
-  console.log(`    select * from products where product_id in (`);
-  for (const line of wrapped(stockUpdates.map((u) => u.product_id).sort((a, b) => a - b))) console.log(line);
-  console.log(`    );  -- ${fmtInt(stockUpdates.length)} rows`);
+  sql(`create table ${BACKUP_PREFIX}_movements_rebalanced as`);
+  sql(`select * from stock_movements where movement_id in (`);
+  for (const line of wrapped(balanceUpdates.map((u) => u.movement_id).sort((a, b) => a - b))) sql(line);
+  sql(`);  -- ${balanceUpdates.length} rows`);
+  sql();
+  sql(`create table ${BACKUP_PREFIX}_products_restocked as`);
+  sql(`select * from products where product_id in (`);
+  for (const line of wrapped(stockUpdates.map((u) => u.product_id).sort((a, b) => a - b))) sql(line);
+  sql(`);  -- ${stockUpdates.length} rows`);
 
   // -------------------------------------------------------------- the apply
   section("11. How --apply would work (not run here)");
@@ -464,31 +593,308 @@ async function main() {
   console.log("    the test product removes all three together, so no product is left");
   console.log("    with dangling history.");
 
-  if (APPLY) {
-    section("--apply REFUSED");
-    const expected = {
-      [`cleanup_${TODAY}_sales`]: testSales.length,
-      [`cleanup_${TODAY}_sale_items`]: testItems.length,
-      [`cleanup_${TODAY}_stock_movements`]: testMovements.length,
-      [`cleanup_${TODAY}_services`]: testServices.length,
-      [`cleanup_${TODAY}_products`]: testProducts.length,
-    };
-    // The backup schema is not exposed to the API, so the counts cannot be
-    // read from here - which is itself the reason this refuses.
-    const { ok, problems } = backupPrecondition(expected, {});
-    console.log("  The backup tables cannot be read through PostgREST: the `backup` schema");
-    console.log("  is not exposed to the API, so this script cannot confirm they exist.");
-    console.log("  Until that check can run, --apply refuses rather than writing blind.");
+  // ------------------------------------------------------- the plan, as ids
+  const plan = {
+    deletes: {
+      sales: [...testSaleIds],
+      sale_items: testItems.map((i) => i.sale_item_id),
+      stock_movements: [...testMovementIds],
+      services: [...testServiceIds],
+      products: [...testProductIds],
+      alerts: testAlerts.map((a) => a.alert_id),
+      advisory_overrides: testOverrides.map((o) => o.product_id),
+    },
+    updates: {
+      stock_movements: balanceUpdates.map((u) => u.movement_id),
+      products: stockUpdates.map((u) => u.product_id),
+    },
+  };
+
+  // Full original rows for the deletes, and the ORIGINAL value of every
+  // column the cleanup overwrites. This is what makes the restore exact
+  // rather than approximate.
+  const byId = (xs, key, ids) => xs.filter((x) => ids.has(x[key]));
+  const updatedMovementIds = new Set(balanceUpdates.map((u) => u.movement_id));
+  const updatedProductIds = new Set(stockUpdates.map((u) => u.product_id));
+  const rows = {
+    deletedRows: {
+      sales: byId(sales, "sale_id", testSaleIds),
+      sale_items: testItems,
+      stock_movements: byId(movements, "movement_id", testMovementIds),
+      services: byId(services, "service_id", testServiceIds),
+      products: byId(products, "product_id", testProductIds),
+      alerts: testAlerts,
+      advisory_overrides: testOverrides,
+    },
+    previousValues: {
+      stock_movements: movements
+        .filter((m) => updatedMovementIds.has(m.movement_id))
+        .map((m) => ({ movement_id: m.movement_id, balance_after: m.balance_after })),
+      products: products
+        .filter((x) => updatedProductIds.has(x.product_id))
+        .map((x) => ({ product_id: x.product_id, stock_on_hand: x.stock_on_hand })),
+    },
+  };
+
+  if (BACKUP_ONLY) {
+    section("Backup only - no rows will be touched");
+    const sqlPath = writeBackupSql(sqlLines);
+    const backupPath = writeBackup({ plan, rows, restockFixes });
+    const reread = JSON.parse(readFileSync(backupPath, "utf8"));
+    const check = verifyBackupFile(plan, reread);
+    const totalRows =
+      Object.values(reread.deletedRows ?? {}).reduce((n, xs) => n + xs.length, 0) +
+      Object.values(reread.previousValues ?? {}).reduce((n, xs) => n + xs.length, 0);
+    console.log(`  backup file : ${backupPath}`);
+    console.log(`  backup SQL  : ${sqlPath}`);
+    console.log(`  rows held   : ${fmtInt(totalRows)}`);
+    console.log(`  verified    : ${check.ok ? "yes, against every table and id" : "NO"}`);
+    for (const p of check.problems) console.log(`    ${p}`);
+    if (!check.ok) process.exitCode = 1;
     console.log("");
-    for (const p of problems.slice(0, 8)) console.log(`    ${p}`);
-    console.log("");
-    console.log(`  ok = ${ok}. Nothing was written.`);
-    process.exitCode = 1;
+    console.log("  Test the restore against it before applying:");
+    console.log(`    node scripts/restore-test-data-cleanup.mjs ${backupPath}`);
     return;
   }
 
+  if (APPLY) {
+    const result = await applyCleanup(sb, {
+      plan, rows, restockFixes, perProduct, testMovementIds, testSaleIds, testItems,
+      testServiceIds, testProductIds, testAlerts, testOverrides, balanceUpdates, stockUpdates,
+      sqlLines,
+    });
+    if (!result.ok) {
+      section("Nothing was written");
+      process.exitCode = 1;
+      return;
+    }
+    section("Applied");
+    console.log(`  backup file : ${result.backupPath}`);
+    console.log(`  backup SQL  : ${result.sqlPath}`);
+    console.log("");
+    console.log("  Verify with : node scripts/verify-cleanup.mjs");
+    console.log("  Undo with   : node scripts/restore-test-data-cleanup.mjs <backup file>");
+    return;
+  }
+
+  // The dry run writes the SQL copy too, so it can be reviewed before any
+  // apply - it is the one artifact that is useful without writing anything.
+  const sqlPath = writeBackupSql(sqlLines);
+  console.log("");
+  console.log(`  SQL copy written to ${sqlPath}`);
+
   section("Dry run complete - nothing was written");
   console.log("  Take the backup above, then review section 11 before asking for --apply.");
+}
+
+// ------------------------------------------------------------------ backup
+//
+// The `backup` schema is not reachable from here: PostgREST executes no DDL
+// and that schema is not exposed to the API. So the backup is a local file,
+// written before anything is touched and then READ BACK and checked against
+// the plan, ids and all. A backup that is merely written is a backup nobody
+// has verified.
+//
+// The file holds real customer data. scripts/backups/ is gitignored.
+function writeBackup({ plan, rows, restockFixes }) {
+  mkdirSync(BACKUP_DIR, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const path = resolve(BACKUP_DIR, `cleanup-test-data-${stamp}.json`);
+
+  const payload = {
+    generatedAt: new Date().toISOString(),
+    script: "cleanup-test-data.mjs",
+    whatThisIs:
+      "Every row the cleanup deletes, in full, plus the ORIGINAL value of every " +
+      "column it overwrites. Enough to put the database back exactly as it was. " +
+      "Restore with scripts/restore-test-data-cleanup.mjs.",
+    // Ids only, in the shape verifyBackupFile() compares.
+    deletes: plan.deletes,
+    updates: plan.updates,
+    // The rows themselves.
+    deletedRows: rows.deletedRows,
+    previousValues: rows.previousValues,
+    // What the cleanup ADDS, so a restore knows what to take away again.
+    inserted: { stock_movements: restockFixes.map((f) => ({ product_id: f.product_id, sku: f.sku, movement_ts: f.movement_ts, quantity: f.quantity })) },
+  };
+
+  writeFileSync(path, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  return path;
+}
+
+function writeBackupSql(lines) {
+  mkdirSync(BACKUP_DIR, { recursive: true });
+  const path = resolve(BACKUP_DIR, "cleanup-backup.sql");
+  writeFileSync(path, `${lines.join("\n")}\n`, "utf8");
+  return path;
+}
+
+async function applyCleanup(sb, ctx) {
+  const {
+    plan, rows, restockFixes, perProduct, testMovementIds, testSaleIds, testItems,
+    testServiceIds, testProductIds, testAlerts, testOverrides, balanceUpdates, stockUpdates,
+    sqlLines,
+  } = ctx;
+
+  section("Backup");
+  const sqlPath = writeBackupSql(sqlLines);
+  console.log(`  backup SQL (optional extra) : ${sqlPath}`);
+  const path = writeBackup({ plan, rows, restockFixes });
+  console.log(`  backup file                 : ${path}`);
+
+  // Read it back off disk rather than trusting what was just in memory.
+  let reread;
+  try {
+    reread = JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    console.log(`  REFUSING: the backup could not be read back (${err.message}). Nothing written.`);
+    return { ok: false };
+  }
+  const check = verifyBackupFile(plan, reread);
+  const totalRows =
+    Object.values(reread.deletedRows ?? {}).reduce((n, xs) => n + xs.length, 0) +
+    Object.values(reread.previousValues ?? {}).reduce((n, xs) => n + xs.length, 0);
+  console.log(`  read back: ${fmtInt(totalRows)} rows across ${Object.keys(reread.deletedRows ?? {}).length} delete sets`);
+  if (!check.ok) {
+    console.log("  REFUSING: the backup does not match the plan.");
+    for (const p of check.problems) console.log(`    ${p}`);
+    return { ok: false };
+  }
+  console.log("  verified against the plan: every table, every id.");
+
+  // --------------------------------------------------- per product
+  section("Applying, product by product");
+  const fixByProduct = new Map(restockFixes.map((f) => [f.product_id, f]));
+  const balanceByProduct = new Map();
+  for (const u of balanceUpdates) {
+    const pid = perProduct.find((p) => p.sku === u.sku)?.productId ?? null;
+    const key = pid ?? u.sku;
+    if (!balanceByProduct.has(key)) balanceByProduct.set(key, []);
+    balanceByProduct.get(key).push(u);
+  }
+  const stockByProduct = new Map(stockUpdates.map((u) => [u.product_id, u]));
+
+  let done = 0;
+  for (const p of perProduct) {
+    const pid = p.productId;
+
+    // 1. the product's test movements
+    const mine = p.chain.filter((m) => testMovementIds.has(m.movement_id)).map((m) => m.movement_id);
+    if (mine.length > 0) {
+      const { error } = await sb.from("stock_movements").delete().in("movement_id", mine);
+      if (error) throw new Error(`${p.sku}: deleting movements failed: ${error.message}`);
+    }
+
+    // 2. its rescue restock, if it needs one. Guarded so a re-run after a
+    //    partial failure does not insert it twice.
+    const fix = fixByProduct.get(pid);
+    if (fix) {
+      const { data: already, error: lookupError } = await sb
+        .from("stock_movements")
+        .select("movement_id")
+        .eq("product_id", pid)
+        .eq("note", SIMULATED_NOTE)
+        .eq("movement_ts", fix.movement_ts);
+      if (lookupError) throw new Error(`${p.sku}: checking for an existing restock failed: ${lookupError.message}`);
+      if ((already ?? []).length === 0) {
+        const inserted = await insertBatched(
+          sb,
+          "stock_movements",
+          [
+            {
+              product_id: pid,
+              sku: fix.sku,
+              movement_type: "stock_in",
+              quantity: fix.quantity,
+              balance_after: fix.balance_after,
+              user_id: null,
+              reference: deliveryReceipt(fix.__ts),
+              note: SIMULATED_NOTE,
+              movement_ts: fix.movement_ts,
+              supplier: fix.supplier,
+              unit_cost: fix.unit_cost,
+            },
+          ],
+          { select: "movement_id" }
+        );
+        fix.movement_id = inserted[0]?.movement_id ?? null;
+      } else {
+        fix.movement_id = already[0].movement_id;
+      }
+    }
+
+    // 3. its rebalanced rows
+    for (const u of balanceByProduct.get(pid) ?? balanceByProduct.get(p.sku) ?? []) {
+      const { error } = await sb
+        .from("stock_movements")
+        .update({ balance_after: u.balance_after })
+        .eq("movement_id", u.movement_id);
+      if (error) throw new Error(`${p.sku}: rebalancing movement ${u.movement_id} failed: ${error.message}`);
+    }
+
+    // 4. its stock_on_hand
+    const stock = stockByProduct.get(pid);
+    if (stock) {
+      const { error } = await sb.from("products").update({ stock_on_hand: stock.next }).eq("product_id", pid);
+      if (error) throw new Error(`${p.sku}: setting stock_on_hand failed: ${error.message}`);
+    }
+
+    done += 1;
+    progressLine(`products ${fmtInt(done)}/${fmtInt(perProduct.length)} (${p.sku})`);
+  }
+  progressDone(`${fmtInt(done)} products done`);
+
+  // ------------------------------------- the rows that belong to no product
+  section("Applying the rest");
+  const del = async (tbl, col, ids) => {
+    if (ids.length === 0) {
+      console.log(`  ${tbl}: nothing to delete`);
+      return;
+    }
+    const { error } = await sb.from(tbl).delete().in(col, ids);
+    if (error) throw new Error(`deleting from ${tbl} failed: ${error.message}`);
+    console.log(`  ${tbl}: ${fmtInt(ids.length)} rows deleted`);
+  };
+
+  // sale_items before sales (they reference it), and everything that points
+  // at the test product before the product itself.
+  await del("sale_items", "sale_item_id", testItems.map((i) => i.sale_item_id));
+  await del("sales", "sale_id", [...testSaleIds]);
+  await del("services", "service_id", [...testServiceIds]);
+  await del("alerts", "alert_id", testAlerts.map((a) => a.alert_id));
+  await del("advisory_overrides", "product_id", testOverrides.map((o) => o.product_id));
+  await del("products", "product_id", [...testProductIds]);
+
+  // ------------------------------------------------------------- manifest
+  appendRestockManifest(restockFixes);
+
+  return { ok: true, backupPath: path, sqlPath };
+}
+
+function appendRestockManifest(restockFixes) {
+  if (restockFixes.length === 0) return;
+  let file = { runs: [] };
+  try {
+    const parsed = JSON.parse(readFileSync(IDS_FILE, "utf8"));
+    if (Array.isArray(parsed.runs)) file = parsed;
+  } catch {
+    // no usable file yet
+  }
+  file.runs.push({
+    generatedAt: new Date().toISOString(),
+    note: SIMULATED_NOTE,
+    mode: "cleanup-restock",
+    why: "one stock_in per product whose chain would have gone negative once the hand-entered test rows were removed",
+    stockMovements: restockFixes.map((f) => ({
+      movement_id: f.movement_id ?? null,
+      sku: f.sku,
+      product_id: f.product_id,
+      movement_ts: f.movement_ts,
+      quantity: f.quantity,
+    })),
+  });
+  writeFileSync(IDS_FILE, `${JSON.stringify(file, null, 2)}\n`, "utf8");
+  console.log(`  appended run ${file.runs.length} to ${IDS_FILE}`);
 }
 
 main().catch((err) => {
