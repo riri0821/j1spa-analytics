@@ -595,9 +595,15 @@ begin
     raise exception 'Already undone.';
   end if;
 
-  -- staff may undo only their own sale on the same day; owner may undo any
+  -- staff may undo only their own sale on the same day; owner may undo any.
+  -- Manila, not UTC: a timestamptz cast to date uses the session's TimeZone,
+  -- which for PostgREST is UTC, and so is current_date - which put "the same
+  -- day" eight hours out of step with the trading day. See
+  -- sql/migrations/031_fix_audit_batch_1.sql.
   if v_role <> 'owner' and (
-    v_sale.user_id is distinct from v_uid or v_sale.sale_ts::date <> current_date
+    v_sale.user_id is distinct from v_uid
+    or (v_sale.sale_ts at time zone 'Asia/Manila')::date
+       <> (now() at time zone 'Asia/Manila')::date
   ) then
     raise exception 'Not allowed to undo this sale.';
   end if;
@@ -838,9 +844,13 @@ begin
     raise exception 'Already undone.';
   end if;
 
-  -- staff may undo only their own record on the same day; owner may undo any
+  -- staff may undo only their own record on the same day; owner may undo
+  -- any. Manila, not UTC - see undo_sale above, and
+  -- sql/migrations/031_fix_audit_batch_1.sql.
   if v_role <> 'owner' and (
-    v_service.user_id is distinct from v_uid or v_service.service_ts::date <> current_date
+    v_service.user_id is distinct from v_uid
+    or (v_service.service_ts at time zone 'Asia/Manila')::date
+       <> (now() at time zone 'Asia/Manila')::date
   ) then
     raise exception 'Not allowed to undo this service record.';
   end if;
