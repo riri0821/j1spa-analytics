@@ -86,7 +86,7 @@ function makeAdvisory(product, type, severity, title, message, recommendation, f
     daysToDepletion: dtd === Infinity ? null : dtd,
     rules: rules.map(([id, expr, result]) => ({ id, expr, result })),
     // isManualType means the owner picked this *type* themselves (see
-    // sql/supabase_add_advisory_overrides.sql) - the rules above are
+    // sql/migrations/020_add_advisory_overrides.sql) - the rules above are
     // still the engine's own real evaluation, which may disagree with
     // the chosen type; that disagreement is expected and shown as-is,
     // never hidden.
@@ -237,7 +237,7 @@ export async function evaluateDecisionSupport(supabase) {
 
   // manual_type is one of 'low_stock' | 'demand_spike' | 'overstock' - the
   // owner's override of which type shows for that SKU, outranking the
-  // rule engine's own result. See sql/supabase_add_advisory_overrides.sql.
+  // rule engine's own result. See sql/migrations/020_add_advisory_overrides.sql.
   const manualTypeMap = new Map((overrideRows ?? []).map((r) => [r.product_id, r.manual_type]));
   const velocityMap = new Map(velocityRows.map((r) => [r.sku, Number(r.units_90d) || 0]));
   const nonZero = [...velocityMap.values()].filter((v) => v > 0);

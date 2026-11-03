@@ -58,7 +58,7 @@ Two settings that matter:
   create a working staff login against the project's anon key.
 * `profiles` has **no update policy**. RLS has no column-level grain, so a
   self-service "update your own profile" policy also covered `role` — see
-  `sql/migrations/021_fix_profiles_role_escalation.sql`. The only write to
+  `sql/migrations/030_fix_profiles_role_escalation.sql`. The only write to
   `profiles` in the whole app is `api/settings/toggle-user`, which uses the
   service-role client and bypasses RLS.
 
@@ -100,9 +100,8 @@ forecast-service/            FastAPI microservice: SMA / WMA / Linear Regression
 sql/
   supabase_schema.sql         full schema (tables, RLS policies, RPC functions) -
                                source of truth for a from-scratch setup
-  supabase_add_*.sql,
-  supabase_fix_*.sql          additive, safe-to-run-against-real-data migrations,
-                               each mirrored into supabase_schema.sql
+  migrations/NNN_*.sql        every change since, numbered in the order it was
+                               applied; each mirrored into supabase_schema.sql
 ```
 
 ---
@@ -145,7 +144,7 @@ The service's `/health` endpoint is unauthenticated by design
 the instance up - no key, no secret, no repository variable.
 
 **The scheduler in use is pg_cron**, installed by
-`sql/supabase_add_forecast_warm_cron.sql`. It calls `net.http_get()` against the
+`sql/migrations/025_add_forecast_warm_cron.sql`. It calls `net.http_get()` against the
 service's `/health` every 5 minutes from the Supabase database this project
 already runs, with no third-party account in the loop:
 
@@ -180,12 +179,16 @@ GitHub workflow if it is enabled.
 ## 5. Database
 
 `sql/supabase_schema.sql` is the full from-scratch schema. Every change since the
-initial migration has also shipped as its own small, additive migration file
-(`sql/supabase_add_*.sql`, `sql/supabase_fix_*.sql`) — safe to run against a live
-database with real data, and kept in sync with `supabase_schema.sql` so a fresh setup
-and an already-running one stay equivalent. Each file's header comment says what it
-depends on, if anything; apply unapplied ones in that order via the Supabase SQL
-Editor.
+initial migration has also shipped as its own small, additive migration file, in
+`sql/migrations/`, numbered in the order it was applied (`001_` first). They are safe
+to run against a live database with real data, and are kept in sync with
+`supabase_schema.sql` so a fresh setup and an already-running one stay equivalent.
+Each file's header comment says what it depends on, if anything; apply unapplied ones
+in number order via the Supabase SQL Editor.
+
+Unapplied right now: **`030_fix_profiles_role_escalation.sql`** — see
+[Creating accounts](#creating-accounts), which also covers the manual owner promotion
+and the Auth setting that has to go with it.
 
 Multi-table writes (`confirm_sale`, `edit_sale`, `undo_sale`, `record_stock_movements`,
 `record_service`, `undo_service`) are Postgres RPC functions — `security definer`,

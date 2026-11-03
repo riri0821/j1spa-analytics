@@ -5,7 +5,7 @@ days-to-depletion / coverage-gap estimate (paper 3.5 / 3.10.3).
 
 Adapted from app/forecast/service.py:
   - monthly_series() now calls the monthly_demand() Postgres function
-    (sql/supabase_phase3_forecast_function.sql) instead of joining the old
+    (sql/migrations/003_phase3_forecast_function.sql) instead of joining the old
     MySQL warehouse's fact_transactions/dim_date/dim_product star schema,
     which no longer exists in the Postgres migration.
   - _daily_curve() takes an already-computed multi-step forecast instead

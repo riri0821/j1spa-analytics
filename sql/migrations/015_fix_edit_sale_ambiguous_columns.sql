@@ -23,7 +23,7 @@
 --
 --  ADDITIVE ONLY - safe to run with real data. Run in a NEW query tab.
 --  Also mirrored into sql/supabase_schema.sql and
---  sql/supabase_add_edit_sale.sql.
+--  sql/migrations/014_add_edit_sale.sql.
 -- =====================================================================
 
 drop function if exists edit_sale(bigint, jsonb, text, text, text, text, text);

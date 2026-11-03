@@ -8,7 +8,7 @@
 --  ADDITIVE ONLY - safe to run against real data. Run in a NEW SQL
 --  Editor query tab. Mirrors sql/supabase_schema.sql, which stays the
 --  source of truth for a from-scratch setup - keep them in sync if you
---  change either. Depends on sql/supabase_add_services.sql already
+--  change either. Depends on sql/migrations/013_add_services.sql already
 --  having been run (needs the services table).
 -- =====================================================================
 

@@ -1,5 +1,5 @@
 // Escalating brute-force login lockout. Backed by the `login_lockouts`
-// table (sql/supabase_add_login_lockouts.sql) rather than an in-memory
+// table (sql/migrations/022_add_login_lockouts.sql) rather than an in-memory
 // dict - a Vercel serverless function can cold-start on any request, so
 // in-process state (what the old Flask app used) wouldn't persist or be
 // shared across instances.

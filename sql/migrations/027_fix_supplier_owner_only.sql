@@ -1,5 +1,5 @@
 -- =====================================================================
---  Change: the same hole sql/supabase_fix_stockin_owner_only.sql closed in
+--  Change: the same hole sql/migrations/026_fix_stockin_owner_only.sql closed in
 --  record_stock_movements(), in the second security-definer function that
 --  writes to products. set_product_supplier() is `security definer`,
 --  granted to `authenticated`, and checks only that the caller has a
@@ -9,7 +9,7 @@
 --  calling the RPC straight from the browser with the anon key.
 --
 --  It was written that way deliberately, back when Stock In was shared with
---  staff (see sql/supabase_fix_stockin_supplier_rls.sql: "Anyone signed in
+--  staff (see sql/migrations/019_fix_stockin_supplier_rls.sql: "Anyone signed in
 --  with a profile may now set a product's supplier"). Stock In is owner-only
 --  now, so that reasoning no longer holds.
 --

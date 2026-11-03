@@ -11,7 +11,7 @@ import { bucketLabel } from "@/lib/grossNetRange";
 // yet; PostgREST answers an unknown function with its own code rather than a
 // SQL error, so both are treated as "not installed" and the chart says what
 // to run instead of showing a failed request.
-const MISSING_FUNCTION = "Run sql/supabase_add_gross_net_range.sql in Supabase";
+const MISSING_FUNCTION = "Run sql/migrations/028_add_gross_net_range.sql in Supabase";
 
 function isMissingFunction(error) {
   return (

@@ -3,7 +3,7 @@
 --  info already captured at Sales Entry (name/contact/address).
 --
 --  ADDITIVE ONLY - safe to run against real data. Run in a NEW SQL
---  Editor query tab, after sql/supabase_add_customer_fields.sql.
+--  Editor query tab, after sql/migrations/011_add_customer_fields.sql.
 --  Mirrors sql/supabase_schema.sql, which stays the source of truth
 --  for a from-scratch setup - keep them in sync if you change either.
 -- =====================================================================

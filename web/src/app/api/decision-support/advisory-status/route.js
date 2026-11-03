@@ -8,7 +8,7 @@ const VALID_TYPES = ["low_stock", "demand_spike", "overstock"];
 // manual override of which advisory type shows for a SKU - takes
 // priority over the rule engine's own evaluation in
 // lib/decisionSupport.js, which still runs and is still shown, just
-// outranked. See sql/supabase_add_advisory_overrides.sql.
+// outranked. See sql/migrations/020_add_advisory_overrides.sql.
 export async function POST(request) {
   // Decision Support is an owner-only screen, so this has to check the role
   // and not just that someone is signed in - a staff session could

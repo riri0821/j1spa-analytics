@@ -29,7 +29,7 @@
 --  dashboard_gross_net_summary() or dashboard_margin_trend(), both of
 --  which stay exactly as they are. Run in a NEW SQL Editor query tab.
 --  Also mirrored into sql/supabase_schema.sql, which stays the source of
---  truth for a from-scratch setup. Depends on sql/supabase_add_services.sql
+--  truth for a from-scratch setup. Depends on sql/migrations/013_add_services.sql
 --  already having been run (needs the services table).
 -- =====================================================================
 

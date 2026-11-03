@@ -107,7 +107,7 @@ begin
     -- Hard-coded, NOT read from raw_user_meta_data: that metadata is
     -- supplied by whoever makes the sign-up request, so reading a role out
     -- of it let a /auth/v1/signup call create its own owner account. See
-    -- sql/migrations/021_fix_profiles_role_escalation.sql.
+    -- sql/migrations/030_fix_profiles_role_escalation.sql.
     'staff'
   );
   return new;
@@ -204,7 +204,7 @@ create table stock_movements (
   note          varchar(255),
   -- snapshots of products.supplier/unit_cost at the moment of a 'stock_in'
   -- movement only (null for 'adjustment' and other types) - see
-  -- sql/supabase_add_stockin_supplier_cost.sql for the full rationale.
+  -- sql/migrations/018_add_stockin_supplier_cost.sql for the full rationale.
   supplier      varchar(120),
   unit_cost     numeric(12,2)
 );
@@ -250,7 +250,7 @@ create index ix_alert_batch on alerts (batch_id);
 create index ix_alert_gen on alerts (generated_ts);
 
 -- owner's override of which Decision Support advisory type shows for a
--- SKU. See sql/supabase_add_advisory_overrides.sql for the full rationale
+-- SKU. See sql/migrations/020_add_advisory_overrides.sql for the full rationale
 -- - the rule engine's own evaluation is never hidden or faked when a
 -- manual_type is set, just outranked.
 create table advisory_overrides (
@@ -261,7 +261,7 @@ create table advisory_overrides (
 );
 
 -- Escalating brute-force login lockout state, keyed on login email. See
--- sql/supabase_add_login_lockouts.sql for the full policy/rationale. No
+-- sql/migrations/022_add_login_lockouts.sql for the full policy/rationale. No
 -- RLS policies are defined below (RLS enabled, none granted) - only the
 -- service-role key, used exclusively from /api/auth/login-guard, can
 -- touch this table.
@@ -404,7 +404,7 @@ create policy "stock_movements_select" on stock_movements for select
 -- inserts are owner-only: staff sales/voids reach this table through the
 -- security-definer functions (confirm_sale, undo_sale, edit_sale), which
 -- bypass RLS, so staff never need direct insert rights. See
--- sql/supabase_fix_stockin_owner_only.sql.
+-- sql/migrations/026_fix_stockin_owner_only.sql.
 create policy "stock_movements_insert" on stock_movements for insert
   with check (current_user_role() = 'owner');
 -- owners can reassign user_id when deleting a staff account
@@ -612,7 +612,7 @@ grant execute on function undo_sale(bigint) to authenticated;
 
 -- edit_sale(): corrects a confirmed sale's line items/note/customer info
 -- in place (owner: any sale; staff: only their own, no same-day limit,
--- unlike undo_sale - see sql/supabase_add_edit_sale.sql for the full
+-- unlike undo_sale - see sql/migrations/014_add_edit_sale.sql for the full
 -- rationale). Reverses the sale's old stock impact, then re-applies the
 -- new item list exactly like confirm_sale, re-pricing at products'
 -- CURRENT unit_price/unit_cost.
@@ -1068,7 +1068,7 @@ language sql
 stable
 as $$
   -- "Sales" = sales + services combined (services at zero cost), matching
-  -- dashboard_gross_net_summary. See sql/supabase_fix_kpi_include_services.sql.
+  -- dashboard_gross_net_summary. See sql/migrations/024_fix_kpi_include_services.sql.
   with combined as (
     select sale_ts as ts, total_amount as amount, total_cost as cost
     from sales
@@ -1093,7 +1093,7 @@ grant execute on function sales_kpi_summary() to authenticated, service_role;
 -- net = gross for that row) into one per-period timeline. Each granularity
 -- gets a fixed calendar window, zero-filled so a no-sales period still
 -- shows as a $0 bar instead of silently vanishing (see
--- supabase_fix_gross_net_windows.sql for the full rationale):
+-- migrations/017_fix_gross_net_windows.sql for the full rationale):
 --   day   - the last 30 calendar days through today
 --   week  - this calendar month only, cut into fixed 7-day chunks
 --           (1-7, 8-14, 15-21, 22-28, 29-end), not Mon-Sun ISO weeks,
@@ -1219,7 +1219,7 @@ grant execute on function dashboard_gross_net_summary(text, integer) to authenti
 -- Buckets on Manila local time rather than a UTC date cast, so a sale made
 -- between midnight and 8 AM Manila is counted on the day it happened; the
 -- function above is left as it is. Empty buckets come back as zero rows.
--- See sql/supabase_add_gross_net_range.sql.
+-- See sql/migrations/028_add_gross_net_range.sql.
 
 create or replace function dashboard_gross_net_range(
   p_start date,

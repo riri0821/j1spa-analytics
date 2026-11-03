@@ -22,7 +22,7 @@
 --
 --  ADDITIVE ONLY - safe to run with real data. Run in a NEW query tab.
 --  Also mirrored into sql/supabase_schema.sql and
---  sql/supabase_fix_gross_net_windows.sql.
+--  sql/migrations/017_fix_gross_net_windows.sql.
 -- =====================================================================
 
 create or replace function dashboard_gross_net_summary(p_granularity text, p_periods integer default 12)
