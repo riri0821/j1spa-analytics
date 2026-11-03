@@ -16,6 +16,13 @@ import {
 } from "./lib/ledgerPlan.mjs";
 import { makeRand, manilaParts, randInt, STORE_CLOSE_HOUR, STORE_OPEN_HOUR } from "./lib/seedlib.mjs";
 import { planDelivery } from "./simulate-recent-activity.mjs";
+import {
+  planProductWindow,
+  planWindowDeliveries,
+  rechainAfterWindow,
+  rechainWindow,
+  splitAroundWindow,
+} from "./lib/gapFill.mjs";
 
 let passed = 0;
 const failures = [];
@@ -495,6 +502,161 @@ is("nothing at all -> nothing to do", classify({ backfilledRows: 0, uncoveredSal
     if (planDelivery({ have: 0, dailyDemand: 0, reorderPoint: 2, lead: randInt(rand, 2, 5), buffer: 3 })) ordered += 1;
   }
   is("a product with no demand is never restocked", ordered, 0);
+}
+
+// ---------------------------------------------- gap mode: chain recomputation
+//
+// Gap mode inserts rows into the MIDDLE of a product's ledger, so the
+// property that matters is different from the backfill's: the window's net
+// change must be exactly zero, because products.stock_on_hand is the end of
+// the chain and the rows after the window already run from it. One unit out
+// and every later balance_after for that product is wrong.
+
+const H = 3600_000;
+const W_START = Date.UTC(2026, 9, 1) - 8 * H;  // 1 Oct 2026, 00:00 Manila
+const W_END = Date.UTC(2026, 9, 7) - 8 * H;    // 7 Oct 2026, 00:00 Manila
+
+// A product's recorded history: two movements before the window, one inside
+// it (a hand-entered test sale), two after. Balances chain to 40.
+const mv = (id, ts, qty, bal) => ({ movement_id: id, movement_ts: ts, quantity: qty, balance_after: bal });
+const HISTORY = [
+  mv(1, W_START - 10 * 86400_000, 50, 50),
+  mv(2, W_START - 2 * 86400_000, -8, 42),
+  mv(3, W_START + 2 * 86400_000, -2, 40),   // inside: the test sale
+  mv(4, W_END + 86400_000, -5, 35),
+  mv(5, W_END + 3 * 86400_000, 10, 45),
+];
+
+{
+  const split = splitAroundWindow(HISTORY, W_START, W_END);
+  is("split: rows before the window", split.before.map((m) => m.movement_id), [1, 2]);
+  is("split: rows inside the window", split.inside.map((m) => m.movement_id), [3]);
+  is("split: rows after the window", split.after.map((m) => m.movement_id), [4, 5]);
+  is("split: the window opens on the last balance before it", split.openingBalance, 42);
+
+  // Unsorted input must give the same answer - movements come back from
+  // PostgREST in id order, which is not always time order after an insert.
+  const shuffled = [HISTORY[3], HISTORY[0], HISTORY[4], HISTORY[2], HISTORY[1]];
+  is("split: input order does not matter",
+    splitAroundWindow(shuffled, W_START, W_END).inside.map((m) => m.movement_id), [3]);
+
+  // A window that precedes the product's whole history derives the opening
+  // balance from the first movement, the same way lib/ledger.js does.
+  const later = splitAroundWindow([mv(9, W_END + 86400_000, -4, 96)], W_START, W_END);
+  is("split: opening balance before any history", later.openingBalance, 100);
+  is("split: no history means no opening balance", splitAroundWindow([], W_START, W_END).openingBalance, null);
+}
+
+{
+  // Deliveries must total exactly what the window sells, and keep the
+  // running balance non-negative.
+  const sameDayAt8 = (ts) => ts - ((ts - (Date.UTC(2026, 9, 1) - 8 * H)) % 86400_000) + 0;
+  const demand = [
+    { ts: W_START + 1 * 86400_000, qty: 5 },
+    { ts: W_START + 2 * 86400_000, qty: 9 },
+    { ts: W_START + 4 * 86400_000, qty: 7 },
+  ];
+  const deliveries = planWindowDeliveries({
+    opening: 6, demand, deliveryTs: sameDayAt8, openingTs: W_START,
+  });
+  const totalIn = deliveries.reduce((s, d) => s + d.qty, 0);
+  const totalOut = demand.reduce((s, d) => s + d.qty, 0);
+  is("deliveries total exactly the units sold", totalIn, totalOut);
+
+  // Walk the merged schedule and check the balance never dips below zero.
+  const merged = [
+    ...deliveries.map((d) => ({ movement_ts: d.ts, quantity: d.qty })),
+    ...demand.map((d) => ({ movement_ts: d.ts, quantity: -d.qty })),
+  ];
+  const walked = rechainWindow({ opening: 6, rows: merged });
+  ok("no negative balance in the window", walked.minBalance >= 0, `min ${walked.minBalance}`);
+  is("the window closes where it opened", walked.closing, 6);
+
+  // A product that starts empty is the 133-products-at-zero case: everything
+  // it sells has to be delivered first.
+  const fromZero = planWindowDeliveries({
+    opening: 0, demand, deliveryTs: sameDayAt8, openingTs: W_START,
+  });
+  is("starting from zero still balances", fromZero.reduce((s, d) => s + d.qty, 0), totalOut);
+  const zeroWalk = rechainWindow({
+    opening: 0,
+    rows: [
+      ...fromZero.map((d) => ({ movement_ts: d.ts, quantity: d.qty })),
+      ...demand.map((d) => ({ movement_ts: d.ts, quantity: -d.qty })),
+    ],
+  });
+  ok("starting from zero never goes negative", zeroWalk.minBalance >= 0, `min ${zeroWalk.minBalance}`);
+  is("starting from zero closes at zero", zeroWalk.closing, 0);
+
+  is("nothing sold means nothing delivered",
+    planWindowDeliveries({ opening: 5, demand: [], deliveryTs: sameDayAt8, openingTs: W_START }), []);
+}
+
+{
+  // Rechaining with an existing row interleaved: the test sale keeps its
+  // place and gets a new balance_after; the ones around it follow.
+  const existing = [mv(3, W_START + 2 * 86400_000, -2, 40)];
+  const fresh = [
+    { movement_ts: W_START + 1 * 86400_000, quantity: 12 },   // delivery
+    { movement_ts: W_START + 3 * 86400_000, quantity: -12 },  // sales
+  ];
+  const plan = planProductWindow({ opening: 42, existingInside: existing, newRows: fresh });
+  is("rechained balances, in order", plan.rows.map((r) => r.balance_after), [54, 52, 40]);
+  is("the existing row's old balance is remembered",
+    plan.rows.find((r) => r.movement_id === 3).previousBalanceAfter, 40);
+  // The ADDED rows net to zero; the window itself still nets to -2, the test
+  // sale that stock_on_hand already accounts for.
+  is("the added rows net to zero", plan.drift, 0);
+  is("the window keeps the net change it already had", [plan.existingNet, plan.netChange], [-2, -2]);
+  is("and still closes where the existing chain did", plan.closing, 40);
+  ok("the plan is usable", plan.ok, plan.problems.join("; "));
+
+  // An existing row and a new row at the same instant: the recorded one
+  // sorts first, so inserting never reorders history.
+  const tie = rechainWindow({
+    opening: 10,
+    rows: [
+      { movement_ts: W_START, quantity: -1 },
+      mv(7, W_START, -2, 8),
+    ],
+  });
+  is("an existing row keeps its place against a new one at the same instant",
+    tie.rows.map((r) => r.movement_id ?? "new"), [7, "new"]);
+}
+
+{
+  // The two ways a plan is refused.
+  const unbalanced = planProductWindow({
+    opening: 20, existingInside: [], newRows: [{ movement_ts: W_START, quantity: -3 }],
+  });
+  is("added rows that do not net to zero are refused", [unbalanced.ok, unbalanced.drift], [false, -3]);
+  ok("and says why", unbalanced.problems.some((p) => p.includes("net to")), unbalanced.problems.join());
+
+  const negative = planProductWindow({
+    opening: 1,
+    existingInside: [],
+    newRows: [
+      { movement_ts: W_START, quantity: -5 },
+      { movement_ts: W_START + H, quantity: 5 },
+    ],
+  });
+  is("a negative balance is refused", negative.ok, false);
+  ok("and says how far", negative.problems.some((p) => p.includes("-4")), negative.problems.join());
+}
+
+{
+  // The payoff: with a net change of zero, nothing after the window moves.
+  const split = splitAroundWindow(HISTORY, W_START, W_END);
+  const openingOfAfter = split.inside[split.inside.length - 1].balance_after; // 40
+  is("no later row is rewritten when the net change is zero",
+    rechainAfterWindow({ closing: 40, openingOfAfter, after: split.after }), []);
+
+  // And if it were not zero, every later row shifts by the drift - which is
+  // exactly the breakage this design exists to avoid.
+  const drifted = rechainAfterWindow({ closing: 43, openingOfAfter, after: split.after });
+  is("a drift of +3 would move every later balance",
+    drifted.map((r) => [r.movement_id, r.previousBalanceAfter, r.balance_after]),
+    [[4, 35, 38], [5, 45, 48]]);
 }
 
 // ------------------------------------------------------------------- done

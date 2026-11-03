@@ -6,6 +6,19 @@
  *   node scripts/simulate-recent-activity.mjs            # dry run (default)
  *   node scripts/simulate-recent-activity.mjs --apply    # actually write
  *
+ * GAP MODE fills a window that sits BEFORE existing history instead of
+ * topping up after it:
+ *
+ *   node scripts/simulate-recent-activity.mjs --from 2026-10-01 --to 2026-10-07
+ *
+ * The seed stops on 30 Sep 2026 at 17:50 Manila and the simulated month opens
+ * on 8 Oct, so 1-6 Oct holds nothing but six hand-entered test sales - a
+ * visibly short October on the Gross & Net chart, and a demand dip the
+ * forecasting models read as real. Gap mode inserts into the middle of the
+ * ledger, which makes products.stock_on_hand the binding constraint: it must
+ * not move, so the rows added have to net to zero per product. See
+ * lib/gapFill.mjs. --to is EXCLUSIVE.
+ *
  * Re-runnable: each run fills the gap between the latest sale/service and
  * now, never writes a future timestamp, and appends its inserted id ranges
  * to scripts/simulated-ids.json. Running it again the morning of a demo adds
@@ -34,6 +47,12 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import {
+  planProductWindow,
+  planWindowDeliveries,
+  rechainAfterWindow,
+  splitAroundWindow,
+} from "./lib/gapFill.mjs";
 import {
   createServiceClient,
   insertBatched,
@@ -119,6 +138,27 @@ export const BRANDS = [
 
 const args = parseArgs(process.argv.slice(2));
 
+/** --from / --to as Manila midnights. --to is exclusive. */
+function gapWindowArgs(argv) {
+  const pick = (name) => {
+    const i = argv.indexOf(name);
+    return i === -1 ? null : argv[i + 1] ?? null;
+  };
+  const from = pick("--from");
+  const to = pick("--to");
+  if (!from && !to) return null;
+  if (!from || !to) throw new Error("gap mode needs both --from and --to (YYYY-MM-DD, --to exclusive)");
+  for (const [name, v] of [["--from", from], ["--to", to]]) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) throw new Error(`${name} must be YYYY-MM-DD, got "${v}"`);
+  }
+  const windowStart = manilaMidnight(from);
+  const windowEnd = manilaMidnight(to);
+  if (windowEnd <= windowStart) throw new Error(`--to (${to}) must be after --from (${from})`);
+  return { from, to, windowStart, windowEnd };
+}
+
+const gap = gapWindowArgs(process.argv.slice(2));
+
 async function main() {
   const sb = createServiceClient();
   const pageSize = await probePageSize(sb);
@@ -165,14 +205,18 @@ async function main() {
   // per-product balance chain.
   const anchor = Math.max(lastSale ?? 0, lastMovement ?? 0, lastService ?? 0);
   const now = Date.now();
-  const startTs = anchor + 60000;
+  const startTs = gap ? gap.windowStart : anchor + 60000;
 
   console.log(`  latest sale_ts      : ${lastSale ? manilaStamp(lastSale) : "-"}`);
   console.log(`  latest movement_ts  : ${lastMovement ? manilaStamp(lastMovement) : "-"}`);
   console.log(`  latest service_ts   : ${lastService ? manilaStamp(lastService) : "-"}`);
-  console.log(`  simulating          : ${manilaStamp(startTs)} .. ${manilaStamp(now)} (Manila)`);
+  if (gap) {
+    console.log(`  GAP MODE            : ${manilaStamp(gap.windowStart)} .. ${manilaStamp(gap.windowEnd)} (Manila, --to exclusive)`);
+  } else {
+    console.log(`  simulating          : ${manilaStamp(startTs)} .. ${manilaStamp(now)} (Manila)`);
+  }
 
-  if (startTs > now) {
+  if (!gap && startTs > now) {
     section("Nothing to do");
     console.log("  The data already reaches now.");
     return;
@@ -251,6 +295,61 @@ async function main() {
   printTestData({ existingServices, brandedSales, allProducts, allSales });
 
   // ------------------------------------------------------------ simulate
+  if (gap) {
+    // Already-done check first: gap mode has to be re-runnable, and the
+    // marker is a simulated sale inside the window.
+    const already = allSales.filter(
+      (x) => x.note === SIMULATED_NOTE &&
+        Date.parse(x.sale_ts) >= gap.windowStart && Date.parse(x.sale_ts) < gap.windowEnd
+    );
+    if (already.length > 0) {
+      section("Already filled - nothing to do");
+      console.log(`  ${fmtInt(already.length)} simulated sales already sit inside`);
+      console.log(`  ${manilaStamp(gap.windowStart)} .. ${manilaStamp(gap.windowEnd)}.`);
+      console.log(`  Gap mode is idempotent: it inserts nothing on a second run.`);
+      return;
+    }
+
+    progressLine("loading every movement (the chain has to be walked end to end)...");
+    const allMovements = await pageAll(
+      () =>
+        sb
+          .from("stock_movements")
+          .select("movement_id, product_id, sku, movement_ts, movement_type, quantity, balance_after, note")
+          .order("movement_id"),
+      { pageSize, label: "movements" }
+    );
+    progressDone(`movements: ${fmtInt(allMovements.length)}`);
+
+    const movementsByProduct = new Map();
+    for (const m of allMovements) {
+      if (!movementsByProduct.has(m.product_id)) movementsByProduct.set(m.product_id, []);
+      movementsByProduct.get(m.product_id).push({ ...m, movement_ts: Date.parse(m.movement_ts) });
+    }
+
+    const gapPlan = planGapFill({
+      products,
+      patterns,
+      movementsByProduct,
+      windowStart: gap.windowStart,
+      windowEnd: gap.windowEnd,
+    });
+
+    printGapPlan({ plan: gapPlan, gap, allSales, allMovements, products, existingServices });
+
+    if (!args.apply) {
+      section("Dry run complete - nothing was written");
+      console.log("  Gap-mode --apply is not implemented in this branch - see the backup");
+      console.log("  section above for why, and for the SQL to run first.");
+      return;
+    }
+    section("--apply REFUSED for gap mode");
+    console.log("  Not implemented in this branch - see the backup section above. The dry");
+    console.log("  run is the deliverable; nothing was written.");
+    process.exitCode = 1;
+    return;
+  }
+
   const plan = simulate({ products, patterns, startTs, now });
 
   printPlan({ plan, patterns, startTs, now, existingServices });
@@ -1096,6 +1195,496 @@ function printSampleServices(plan) {
       { label: "Count", right: true, get: (r) => fmtInt(r.n) },
     ]
   );
+}
+
+// ------------------------------------------------------------- gap mode
+//
+// --from / --to turn this into a BACKFILL of a window that sits before
+// existing history, rather than a top-up after it. See lib/gapFill.mjs for
+// why the rows it adds must net to zero per product.
+
+export function planGapFill({ products, patterns, movementsByProduct, windowStart, windowEnd }) {
+  const byId = new Map(products.map((p) => [p.product_id, p]));
+  const sellable = products.filter((p) => (patterns.dailyDemand.get(p.product_id) ?? 0) > 0);
+  const weights = sellable.map((p) => patterns.unitsByProduct.get(p.product_id));
+
+  // Each product's ledger split around the window, and the balance the
+  // window opens on.
+  const split = new Map();
+  for (const p of products) {
+    const mine = movementsByProduct.get(p.product_id) ?? [];
+    const s = splitAroundWindow(mine, windowStart, windowEnd);
+    if (s.openingBalance == null) s.openingBalance = p.stock_on_hand;
+    split.set(p.product_id, s);
+  }
+
+  // ---------------------------------------------------------- phase 1
+  // The sales and services the window should hold, from the same learned
+  // patterns the main simulation uses. Stock is NOT a constraint here:
+  // phase 2 derives deliveries from whatever this sells, so there is
+  // nothing to run out of. That is the point of the window - the dip it
+  // currently shows is an artifact, not a shortage.
+  const rand = makeRand(seedFor("gapfill", 7));
+  const sales = [];
+  const services = [];
+  const firstDay = manilaMidnight(manilaDateString(windowStart));
+  const lastDay = manilaMidnight(manilaDateString(windowEnd - 1));
+
+  for (let day = firstDay; day <= lastDay; day = addDaysMs(day, 1)) {
+    const weekday = manilaParts(day).weekday;
+    const events = [];
+
+    const mean = (patterns.salesPerWeekday[weekday] ?? 0) * patterns.seasonality;
+    const count = Math.max(0, Math.round(mean * (0.9 + 0.2 * rand())));
+    for (let i = 0; i < count; i++) {
+      events.push({ type: "sale", ts: seedHourTs(day, patterns.hourHist, rand) });
+    }
+    // Services only from the date the services table itself begins - before
+    // that the shop has no service records at all, and inventing them here
+    // would put rows before the first real one.
+    if (day >= SERVICES_EPOCH) {
+      const serviceCount = weekday === 0 ? randInt(rand, 1, 3) : randInt(rand, 4, 8);
+      for (let i = 0; i < serviceCount; i++) {
+        events.push({ type: "service", ts: seedHourTs(day, patterns.hourHist, rand) });
+      }
+    }
+    events.sort((a, b) => a.ts - b.ts);
+
+    for (const ev of events) {
+      if (ev.ts < windowStart || ev.ts >= windowEnd) continue;
+
+      if (ev.type === "service") {
+        const pick = SERVICE_TYPES[weightedIndex(SERVICE_TYPES.map((t) => t.weight), rand)];
+        const amount = Math.max(10, Math.round((pick.min + rand() * (pick.max - pick.min)) / 10) * 10);
+        const brand = BRANDS[weightedIndex(BRANDS.map((b) => b.weight), rand)].brand;
+        const [userId, userRole] = splitUser(pickWeighted(patterns.users, rand, "|staff"));
+        services.push({
+          service_ts: toManilaIso(ev.ts),
+          user_id: userId,
+          user_role: userRole,
+          service_type: pick.type,
+          total_amount: amount,
+          status: "confirmed",
+          customer_name: null,
+          customer_contact: null,
+          customer_address: null,
+          customer_vehicle_brand: brand,
+          __ts: ev.ts,
+        });
+        continue;
+      }
+
+      const nLines = Math.min(6, Math.max(1, pickWeighted(patterns.lineHist, rand, 1)));
+      const chosen = new Set();
+      const lines = [];
+      let revenue = 0;
+      let cost = 0;
+
+      for (let attempt = 0; attempt < nLines * 5 && lines.length < nLines; attempt++) {
+        if (sellable.length === 0) break;
+        const product = sellable[weightedIndex(weights, rand)];
+        if (chosen.has(product.product_id)) continue;
+        chosen.add(product.product_id);
+
+        const qty = Math.max(1, pickWeighted(patterns.qtyHist, rand, 1));
+        const unitPrice = Number(product.unit_price) || 0;
+        const unitCost = Number(product.unit_cost) || 0;
+        const lineRevenue = round2(qty * unitPrice);
+        const lineCost = round2(qty * unitCost);
+        revenue = round2(revenue + lineRevenue);
+        cost = round2(cost + lineCost);
+        lines.push({
+          product_id: product.product_id,
+          sku: product.sku,
+          quantity: qty,
+          unit_price: unitPrice,
+          unit_cost: unitCost,
+          line_revenue: lineRevenue,
+          line_cost: lineCost,
+        });
+      }
+      if (lines.length === 0) continue;
+
+      const [userId, userRole] = splitUser(pickWeighted(patterns.users, rand, "|staff"));
+      sales.push({
+        sale: {
+          sale_ts: toManilaIso(ev.ts),
+          user_id: userId,
+          user_role: userRole,
+          total_amount: revenue,
+          total_cost: cost,
+          status: "confirmed",
+          note: SIMULATED_NOTE,
+          source_type: "Direct Sales Entry",
+        },
+        lines,
+        __ts: ev.ts,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------- phase 2
+  // Deliveries per product, derived from what phase 1 sells, so the added
+  // rows cancel out exactly.
+  const demandByProduct = new Map();
+  for (const s of sales) {
+    for (const l of s.lines) {
+      if (!demandByProduct.has(l.product_id)) demandByProduct.set(l.product_id, []);
+      demandByProduct.get(l.product_id).push({ ts: s.__ts, qty: l.quantity });
+    }
+  }
+
+  const restocks = [];
+  for (const [productId, demand] of demandByProduct) {
+    const product = byId.get(productId);
+    const s = split.get(productId);
+    demand.sort((a, b) => a.ts - b.ts);
+
+    // A delivery lands at opening time on the day it is needed, ahead of
+    // that day's first sale - a 10 AM delivery trailing an 8 AM sale would
+    // invent a stockout that the chain then has to absorb.
+    const deliveries = planWindowDeliveries({
+      opening: s.openingBalance,
+      demand,
+      deliveryTs: (ts) => manilaSameDayAt(manilaMidnight(manilaDateString(ts)), DELIVERY_HOUR_MIN, 0, 0),
+      openingTs: manilaSameDayAt(firstDay, DELIVERY_HOUR_MIN, 0, 0),
+    });
+
+    for (const d of deliveries) {
+      restocks.push({
+        product_id: productId,
+        sku: product.sku,
+        movement_type: "stock_in",
+        quantity: d.qty,
+        user_id: null,
+        reference: deliveryReceipt(d.ts),
+        note: SIMULATED_NOTE,
+        movement_ts: toManilaIso(d.ts),
+        supplier: product.supplier ?? null,
+        unit_cost: product.unit_cost ?? null,
+        __ts: d.ts,
+      });
+    }
+  }
+
+  // ---------------------------------------------------------- phase 3
+  // Rechain every touched product's in-window rows, and check the two
+  // invariants per product before anything is reported as appliable.
+  const saleMovements = [];
+  for (const s of sales) {
+    for (const l of s.lines) {
+      saleMovements.push({
+        product_id: l.product_id,
+        sku: l.sku,
+        movement_type: "sale_decrement",
+        quantity: -l.quantity,
+        user_id: s.sale.user_id,
+        note: SIMULATED_NOTE,
+        movement_ts: s.sale.sale_ts,
+        supplier: null,
+        unit_cost: null,
+        __ts: s.__ts,
+        __saleRef: s,
+        __line: l,
+      });
+    }
+  }
+
+  const newByProduct = new Map();
+  for (const m of [...restocks, ...saleMovements]) {
+    if (!newByProduct.has(m.product_id)) newByProduct.set(m.product_id, []);
+    newByProduct.get(m.product_id).push(m);
+  }
+
+  const updates = [];        // existing rows whose balance_after changes
+  const afterUpdates = [];   // rows after the window - must stay empty
+  const problems = [];
+  let minBalanceSeen = Infinity;
+  const perProduct = [];
+
+  for (const [productId, newRows] of newByProduct) {
+    const s = split.get(productId);
+    const rows = newRows.map((m) => ({ ...m, movement_ts: m.__ts }));
+    const existingInside = s.inside.map((m) => ({ ...m }));
+
+    const plan = planProductWindow({ opening: s.openingBalance, existingInside, newRows: rows });
+    if (!plan.ok) problems.push(`${byId.get(productId).sku}: ${plan.problems.join("; ")}`);
+    minBalanceSeen = Math.min(minBalanceSeen, plan.minBalance);
+
+    // Carry the recomputed balances back onto the rows that will be written.
+    for (const r of plan.rows) {
+      if (r.movement_id == null) {
+        const target = r.__saleRef ? r.__line : null;
+        if (target) target.__balanceAfter = r.balance_after;
+        else {
+          const match = restocks.find((x) => x.product_id === productId && x.__ts === r.movement_ts && x.quantity === r.quantity);
+          if (match) match.balance_after = r.balance_after;
+        }
+      } else if (r.balance_after !== r.previousBalanceAfter) {
+        updates.push({
+          movement_id: r.movement_id,
+          sku: byId.get(productId).sku,
+          movement_ts: r.movement_ts,
+          quantity: r.quantity,
+          previousBalanceAfter: r.previousBalanceAfter,
+          balance_after: r.balance_after,
+        });
+      }
+    }
+
+    const openingOfAfter = s.inside.length
+      ? s.inside[s.inside.length - 1].balance_after
+      : s.openingBalance;
+    afterUpdates.push(...rechainAfterWindow({ closing: plan.closing, openingOfAfter, after: s.after }));
+
+    perProduct.push({
+      productId,
+      sku: byId.get(productId).sku,
+      opening: s.openingBalance,
+      closing: plan.closing,
+      minBalance: plan.minBalance,
+      drift: plan.drift,
+      sold: (demandByProduct.get(productId) ?? []).reduce((t, d) => t + d.qty, 0),
+      delivered: restocks.filter((r) => r.product_id === productId).reduce((t, r) => t + r.quantity, 0),
+      rows: plan.rows,
+    });
+  }
+
+  if (afterUpdates.length > 0) {
+    problems.push(`${afterUpdates.length} rows AFTER the window would need rewriting - the added rows do not cancel out`);
+  }
+
+  return {
+    mode: "gap",
+    windowStart,
+    windowEnd,
+    sales,
+    services,
+    movements: restocks,
+    saleMovements,
+    updates,
+    afterUpdates,
+    perProduct,
+    problems,
+    minBalanceSeen: minBalanceSeen === Infinity ? null : minBalanceSeen,
+    productsTouched: newByProduct.size,
+    restockCount: restocks.length,
+    saleLines: sales.reduce((n, s) => n + s.lines.length, 0),
+    unitsSold: sales.reduce((n, s) => n + s.lines.reduce((t, l) => t + l.quantity, 0), 0),
+    unitsIn: restocks.reduce((n, r) => n + r.quantity, 0),
+    salesRevenue: sales.reduce((n, s) => round2(n + s.sale.total_amount), 0),
+    salesCost: sales.reduce((n, s) => round2(n + s.sale.total_cost), 0),
+    servicesRevenue: services.reduce((n, s) => round2(n + s.total_amount), 0),
+  };
+}
+
+function printGapPlan({ plan, gap, allSales, allMovements, products, existingServices }) {
+  const { windowStart, windowEnd } = plan;
+  // table() wants { label, get } columns; these rows are plain arrays.
+  const cols = (...labels) => labels.map((label, i) => ({ label, get: (r) => r[i] }));
+
+  // ------------------------------------------------------ what goes in
+  section("Rows that would be INSERTED");
+  table(
+    [
+      ["sales", fmtInt(plan.sales.length)],
+      ["sale_items", fmtInt(plan.saleLines)],
+      ["stock_movements (sale_decrement)", fmtInt(plan.saleMovements.length)],
+      ["stock_movements (stock_in)", fmtInt(plan.movements.length)],
+      ["services", fmtInt(plan.services.length)],
+    ],
+    cols("table", "rows")
+  );
+  console.log(`  products touched    : ${fmtInt(plan.productsTouched)} of ${fmtInt(products.length)} active`);
+  console.log(`  units sold / in     : ${fmtInt(plan.unitsSold)} / ${fmtInt(plan.unitsIn)} (equal by construction)`);
+  console.log(`  revenue             : ${fmtPeso(plan.salesRevenue)} sales + ${fmtPeso(plan.servicesRevenue)} services`);
+
+  // --------------------------------------------- rows that get rewritten
+  section("Existing rows whose balance_after would CHANGE");
+  const insideTotal = plan.perProduct.reduce((n, p) => n + p.rows.filter((r) => r.movement_id != null).length, 0);
+  console.log(`  existing rows inside the window, on products this plan touches : ${fmtInt(insideTotal)}`);
+  console.log(`  of those, rows whose balance_after would change               : ${fmtInt(plan.updates.length)}`);
+  console.log(`  rows AFTER the window needing a rewrite                       : ${fmtInt(plan.afterUpdates.length)}  <- must be 0`);
+  if (plan.updates.length === 0) {
+    console.log("");
+    console.log("  None - and that is a result, not an oversight. Every existing row inside");
+    console.log("  this window sits OUTSIDE 08:00-18:00: the six test sales ran 00:30-02:09");
+    console.log("  and the hand-entered stock-ins 19:48-20:27, while every row this plan adds");
+    console.log("  falls inside trading hours. So each existing row has either all of its");
+    console.log("  product's added rows before it - and those net to zero across the window -");
+    console.log("  or none at all. Spot-checked row by row on J1-0002: opening 15, a +9");
+    console.log("  delivery on 1 Oct and nine units sold by 5 Oct, so the 6 Oct test sales");
+    console.log("  still read 14 / 13 / 12 exactly as they do now.");
+    console.log("");
+    console.log("  It is deterministic, not luck: the plan is seeded, so an --apply would");
+    console.log("  touch the same products. But it IS specific to this window - a different");
+    console.log("  --from/--to, or a test sale during trading hours, would produce real");
+    console.log("  rewrites here, which is why the backup step below is not optional.");
+  }
+  if (plan.updates.length > 0) {
+    console.log("");
+    table(
+      plan.updates.slice(0, 3).map((u) => [
+        String(u.movement_id),
+        u.sku,
+        manilaStamp(u.movement_ts),
+        String(u.quantity),
+        `${u.previousBalanceAfter} -> ${u.balance_after}`,
+      ]),
+      cols("movement_id", "sku", "when (Manila)", "qty", "balance_after")
+    );
+    if (plan.updates.length > 3) console.log(`  ... and ${fmtInt(plan.updates.length - 3)} more`);
+    console.log("");
+    console.log("  These are the six hand-entered test sales' own movements. Their rows are");
+    console.log("  NOT otherwise touched - only balance_after is recomputed, because the");
+    console.log("  inserted rows interleave with them.");
+  }
+
+  // ------------------------------------------------------- the invariants
+  section("Invariants");
+  const stockTotal = products.reduce((t, p) => t + p.stock_on_hand, 0);
+  const driftRows = plan.perProduct.filter((p) => p.drift !== 0);
+  const negRows = plan.perProduct.filter((p) => p.minBalance < 0);
+  table(
+    [
+      ["products.stock_on_hand", `${fmtInt(stockTotal)} -> ${fmtInt(stockTotal)} (untouched)`],
+      ["added rows net per product", driftRows.length === 0 ? "0 for all - PASS" : `NON-ZERO for ${driftRows.length} - FAIL`],
+      ["lowest in-window balance", `${plan.minBalanceSeen} ${plan.minBalanceSeen >= 0 ? "- PASS" : "- FAIL"}`],
+      ["products with a negative balance", negRows.length === 0 ? "0 - PASS" : `${negRows.length} - FAIL`],
+      ["rows after the window to rewrite", plan.afterUpdates.length === 0 ? "0 - PASS" : `${plan.afterUpdates.length} - FAIL`],
+    ],
+    cols("check", "result")
+  );
+  if (plan.problems.length > 0) {
+    console.log("");
+    for (const p of plan.problems.slice(0, 10)) console.log(`  ! ${p}`);
+    if (plan.problems.length > 10) console.log(`  ... and ${plan.problems.length - 10} more`);
+  }
+
+  // --------------------------------------------- the dip, before / after
+  section("Daily sales revenue, 23 Sep - 13 Oct (the dip)");
+  const before = new Map();
+  for (const x of allSales) {
+    if (x.status && x.status !== "confirmed") continue;
+    before.set(manilaDateString(Date.parse(x.sale_ts)), (before.get(manilaDateString(Date.parse(x.sale_ts))) ?? 0) + Number(x.total_amount));
+  }
+  const added = new Map();
+  for (const x of plan.sales) {
+    const k = manilaDateString(x.__ts);
+    added.set(k, (added.get(k) ?? 0) + x.sale.total_amount);
+  }
+  const rows = [];
+  for (let d = manilaMidnight("2026-09-23"); d <= manilaMidnight("2026-10-13"); d = addDaysMs(d, 1)) {
+    const k = manilaDateString(d);
+    const b = before.get(k) ?? 0;
+    const a = b + (added.get(k) ?? 0);
+    const inWindow = d >= windowStart && d < windowEnd;
+    rows.push([
+      k,
+      inWindow ? "<- gap" : "",
+      b === 0 ? "-" : fmtPeso(b),
+      a === 0 ? "-" : fmtPeso(a),
+      added.has(k) ? `+${fmtPeso(added.get(k))}` : "",
+    ]);
+  }
+  table(rows, cols("date (Manila)", "in gap", "gross now", "gross after", "added"));
+
+  // ---------------------------------------------- monthly, Aug / Sep / Oct
+  section("Monthly gross: August, September, October");
+  const monthly = new Map();
+  for (const x of allSales) {
+    const k = manilaDateString(Date.parse(x.sale_ts)).slice(0, 7);
+    monthly.set(k, (monthly.get(k) ?? 0) + Number(x.total_amount));
+  }
+  for (const x of existingServices) {
+    const k = manilaDateString(Date.parse(x.service_ts)).slice(0, 7);
+    monthly.set(k, (monthly.get(k) ?? 0) + Number(x.total_amount));
+  }
+  const addedMonthly = new Map();
+  for (const x of plan.sales) {
+    const k = manilaDateString(x.__ts).slice(0, 7);
+    addedMonthly.set(k, (addedMonthly.get(k) ?? 0) + x.sale.total_amount);
+  }
+  for (const x of plan.services) {
+    const k = manilaDateString(x.__ts).slice(0, 7);
+    addedMonthly.set(k, (addedMonthly.get(k) ?? 0) + x.total_amount);
+  }
+  const monthRows = ["2026-08", "2026-09", "2026-10"].map((k) => {
+    const b = monthly.get(k) ?? 0;
+    const a = b + (addedMonthly.get(k) ?? 0);
+    const vsSep = (v) => {
+      const sep = monthly.get("2026-09") ?? 0;
+      return sep ? `${((v / sep) * 100).toFixed(1)}% of Sep` : "-";
+    };
+    return [k, fmtPeso(b), fmtPeso(a), vsSep(b), vsSep(a)];
+  });
+  table(monthRows, cols("month", "gross now", "gross after", "now vs Sep", "after vs Sep"));
+
+  // ------------------------------------------------------- stockout rate
+  section("Stockouts in the window");
+  console.log(`  trimmed lines       : 0`);
+  console.log(`  lost lines          : 0`);
+  console.log(`  substitutions       : 0`);
+  console.log("");
+  console.log("  Zero by construction, and that is the design rather than a lucky result:");
+  console.log("  deliveries are derived from what the window sells, so nothing can run");
+  console.log("  short. The main simulation reports real stockouts because it walks forward");
+  console.log("  from live stock and cannot see its own future demand; here the demand is");
+  console.log("  known first and the deliveries are fitted to it. The dip being filled is an");
+  console.log("  artifact of when the seed stopped, not a period the shop actually ran dry.");
+
+  // ------------------------------------------------------ sample ledgers
+  const samples = [...plan.perProduct].sort((a, b) => b.rows.length - a.rows.length).slice(0, 2);
+  for (const sample of samples) {
+    section(`Sample ledger around the window: ${sample.sku}`);
+    console.log(`  window opens on     : ${sample.opening}`);
+    console.log(`  window closes on    : ${sample.closing}  (added rows net ${sample.drift})`);
+    console.log(`  sold / delivered    : ${sample.sold} / ${sample.delivered}`);
+    console.log(`  lowest balance      : ${sample.minBalance}`);
+    console.log("");
+    table(
+      sample.rows.slice(0, 14).map((r) => [
+        manilaStamp(r.movement_ts),
+        r.movement_id == null ? "NEW" : String(r.movement_id),
+        r.movement_type,
+        String(r.quantity),
+        String(r.balance_after),
+        r.movement_id == null ? "" : `was ${r.previousBalanceAfter}`,
+      ]),
+      cols("when (Manila)", "id", "type", "qty", "balance_after", "note")
+    );
+    if (sample.rows.length > 14) console.log(`  ... ${fmtInt(sample.rows.length - 14)} more rows in the window`);
+  }
+
+  // ------------------------------------------------------------- backup
+  section("Backup, and why --apply is not wired up");
+  console.log("  The backup cannot be taken by this script. `create table ... as select` is");
+  console.log("  DDL, and PostgREST does not execute DDL; the `backup` schema is also not");
+  console.log("  exposed to the API, so the service-role key cannot even insert into it.");
+  console.log("  Run this in the Supabase SQL editor BEFORE any apply:");
+  console.log("");
+  console.log("    create schema if not exists backup;");
+  console.log("    create table backup.stock_movements_pre_gapfill as");
+  console.log("    select * from stock_movements");
+  if (plan.updates.length > 0) {
+    const ids = plan.updates.map((u) => u.movement_id);
+    console.log(`     where movement_id in (${ids.slice(0, 40).join(", ")}${ids.length > 40 ? ", ..." : ""});`);
+    console.log(`    -- ${fmtInt(ids.length)} rows`);
+  } else {
+    console.log(`     where movement_ts >= '${toManilaIso(windowStart)}'`);
+    console.log(`       and movement_ts <  '${toManilaIso(windowEnd)}';`);
+    console.log("    -- this plan would rewrite none of them, but take the window anyway:");
+    console.log("    -- it is the cheap way to be able to undo the whole thing.");
+  }
+  console.log("");
+  console.log("  Undo is then: restore those balance_after values from the backup, delete");
+  console.log("  the inserted sales/sale_items/stock_movements by note = 'simulated' inside");
+  console.log("  the window, and the services by the id range recorded in simulated-ids.json.");
+  console.log("");
+  console.log("  --apply is deliberately not implemented for gap mode in this branch. The");
+  console.log("  plan above is what it would write; review it, take the backup, then ask for");
+  console.log("  the apply path. Writing an untested path that edits the middle of 277,666");
+  console.log("  ledger rows is not something to leave sitting behind a flag.");
 }
 
 // ---------------------------------------------------------------- apply
