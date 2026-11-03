@@ -34,10 +34,13 @@ export async function POST(request) {
   // A product with recorded sales, stock movements, or alerts can't be
   // hard-deleted without breaking that history, so it's deactivated
   // (hidden from active lists) instead - same rule as the original app.
+  // One named column each, not select("*"): a star asks for every column,
+  // and migration 034 revokes select on sale_items.unit_cost / line_cost
+  // from `authenticated`, which would turn these counts into errors.
   const [{ count: saleCount }, { count: movementCount }, { count: alertCount }] = await Promise.all([
-    supabase.from("sale_items").select("*", { count: "exact", head: true }).eq("product_id", productId),
-    supabase.from("stock_movements").select("*", { count: "exact", head: true }).eq("product_id", productId),
-    supabase.from("alerts").select("*", { count: "exact", head: true }).eq("product_id", productId),
+    supabase.from("sale_items").select("sale_item_id", { count: "exact", head: true }).eq("product_id", productId),
+    supabase.from("stock_movements").select("movement_id", { count: "exact", head: true }).eq("product_id", productId),
+    supabase.from("alerts").select("alert_id", { count: "exact", head: true }).eq("product_id", productId),
   ]);
 
   if (saleCount || movementCount || alertCount) {

@@ -35,8 +35,57 @@ the fly rather than a separately-synced star schema.
 * **staff** → sales entry + services only. No stock-in, cost, gross profit,
   analytics, forecasts, or advisories.
 
-Enforced both at the page level (role check + redirect) and at the database level
-(Postgres Row Level Security policies), not just hidden in the UI.
+Enforced at the page level (role check + redirect) and at the database level, not
+just hidden in the UI.
+
+### How "staff never see cost or profit" is enforced
+
+Row Level Security alone cannot do this. Owner and staff both authenticate as the
+Postgres role `authenticated`, and RLS decides which ROWS a role may read, never
+which columns. So until migration 034 the split was real in the UI and cosmetic
+in the database: a staff session holding the publishable anon key could read
+`products.unit_cost`, `sales.total_cost`, `sale_items.unit_cost` and
+`line_cost`, `stock_movements.unit_cost`, `vw_product_velocity.gross_profit_90d`,
+and call `sales_kpi_summary()`, `dashboard_margin_trend()` and
+`dashboard_gross_net_range()`, whose `net` is profit.
+
+Two mechanisms close it, and they work together:
+
+1. **Column privileges** (`034_lock_cost_columns.sql`). `select` is revoked from
+   `authenticated` on `products`, `sales`, `sale_items` and `stock_movements`,
+   then granted back on the non-cost columns only. `vw_product_velocity` and the
+   three cost-bearing functions are revoked outright. This takes the cost columns
+   from the OWNER too, because the owner is `authenticated` as well, which is the
+   point: there is no privilege that separates them.
+2. **Owner-checked functions** (`033_add_owner_cost_access.sql`). Seven
+   `security definer` functions with a fixed `search_path`, each opening with
+   `if current_user_role() <> 'owner' then raise exception`. A definer function
+   runs as its own owner, so column privileges do not apply inside it, and the
+   role check is what decides who gets an answer. These are how the owner screens
+   reach cost: `owner_product_catalog`, `owner_product_performance`,
+   `owner_sales_kpi_summary`, `owner_margin_trend`, `owner_gross_net_range`,
+   `owner_stockin_log`, `owner_stockin_by_supplier`.
+
+`stock_movements`, `alerts` and `advisory_overrides` also become owner-only at the
+row level: no staff screen reads any of them, which was checked in the code before
+the policies changed.
+
+`service_role` is untouched throughout. The forecast service, the seed scripts and
+the CSV export routes hold their privileges separately, and the export routes use
+the service-role client behind `requireOwner()`.
+
+**Checked, not asserted.** `web/scripts/check-staff-access.mjs` creates a
+temporary staff user through the admin API, signs in as that user with the anon
+key the browser uses, and tries every cost column, view and function in turn,
+then confirms staff can still do their job (read the product fields Sales Entry
+needs, read sales and services, reach `confirm_sale`). It deletes the temporary
+user in a `finally` block.
+
+```bash
+cd web
+node scripts/check-staff-access.mjs --expect=before   # before 034: cost reads succeed
+node scripts/check-staff-access.mjs --expect=after    # after 034: they must all fail
+```
 
 ### Creating accounts
 
@@ -132,6 +181,8 @@ web/                        the live application
     verify-cleanup.mjs         read-only checks that each of those did what it
                                 said: chains consistent, no negative balances,
                                 totals as expected
+    check-staff-access.mjs     signs in as a temporary staff user and proves
+                                what that session can and cannot read
     simulated-ids.json         the id ranges each run inserted
     backups/                   local only, gitignored: whole customer rows
 
@@ -233,6 +284,16 @@ Every migration through `032_fix_batch_2.sql` has been applied to the live datab
 See [Creating accounts](#creating-accounts) for the manual owner promotion and the
 Auth setting that goes with `030_fix_profiles_role_escalation.sql`.
 
+**033 and 034 are ordered around a deploy, which is unusual here and matters.**
+
+| | |
+| --- | --- |
+| `033_add_owner_cost_access.sql` | Run **before** deploying. Purely additive: it adds the owner-checked functions and revokes nothing, so the running code keeps working and the new functions sit unused. |
+| `034_lock_cost_columns.sql` | Run **after** the deploy is live. Restrictive: it revokes the cost columns, the view and the three original functions. Run it against a deployment that still reads them directly and those screens break at once. |
+| `034_rollback.sql` | Puts every grant and policy 034 changed back exactly as it was, if something breaks before there is time to fix it. It reopens the hole, so it buys an hour rather than being somewhere to stay. |
+
+Confirm with `node scripts/check-staff-access.mjs --expect=after` once 034 is in.
+
 Multi-table writes (`confirm_sale`, `edit_sale`, `undo_sale`, `record_stock_movements`,
 `record_service`, `undo_service`) are Postgres RPC functions: `security definer`,
 row-locking and atomic, because PostgREST alone can't do a locking multi-statement
@@ -275,8 +336,11 @@ transaction in one call.
   (`031_fix_audit_batch_1.sql`), with `api/products/save` rejecting negatives
   with a 400 before they get that far.
 
-Known gap: cost and gross-profit columns are hidden by the UI but not yet by the
-database. See the note in [Roles](#2-roles).
+* **Cost and profit are owner-only in the database**, not only in the UI: column
+  privileges on the four tables that carry them, plus seven owner-checked
+  security-definer functions for the owner screens that need them
+  (`033_add_owner_cost_access.sql`, `034_lock_cost_columns.sql`). See
+  [How "staff never see cost or profit" is enforced](#how-staff-never-see-cost-or-profit-is-enforced).
 
 ---
 

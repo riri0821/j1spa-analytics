@@ -198,12 +198,16 @@ async function loadLatestBatch(supabase) {
 }
 
 export async function evaluateDecisionSupport(supabase) {
-  const [velocityRows, products, { data: monthlyRows }, { data: overrideRows }] = await Promise.all([
+  const [{ data: velocityRows, error: velocityError }, products, { data: monthlyRows }, { data: overrideRows }] =
+    await Promise.all([
     // Both paged: a plain select stops at PostgREST's 1000-row default, which
     // would quietly drop products from the evaluation (and from the chip
     // totals below). .order() is what makes the paging stable - without a
     // sort, range requests can return overlapping pages.
-    fetchAllRows(() => supabase.from("vw_product_velocity").select("sku, units_90d").order("sku")),
+    // Only units_90d is wanted here, but the view it came from also carries
+    // gross_profit_90d, which migration 034 puts out of `authenticated`'s
+    // reach. The owner-checked function returns both; this uses one.
+    supabase.rpc("owner_product_performance"),
     fetchAllRows(() =>
       supabase
         .from("products")
@@ -238,8 +242,12 @@ export async function evaluateDecisionSupport(supabase) {
   // manual_type is one of 'low_stock' | 'demand_spike' | 'overstock' - the
   // owner's override of which type shows for that SKU, outranking the
   // rule engine's own result. See sql/migrations/020_add_advisory_overrides.sql.
+  if (velocityError) {
+    console.error("evaluateDecisionSupport: owner_product_performance failed - velocity reads as zero:", velocityError.message);
+  }
+
   const manualTypeMap = new Map((overrideRows ?? []).map((r) => [r.product_id, r.manual_type]));
-  const velocityMap = new Map(velocityRows.map((r) => [r.sku, Number(r.units_90d) || 0]));
+  const velocityMap = new Map((velocityRows ?? []).map((r) => [r.sku, Number(r.units_90d) || 0]));
   const nonZero = [...velocityMap.values()].filter((v) => v > 0);
   const velocityMedian = median(nonZero);
 

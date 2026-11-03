@@ -11,7 +11,7 @@ import { bucketLabel } from "@/lib/grossNetRange";
 // yet; PostgREST answers an unknown function with its own code rather than a
 // SQL error, so both are treated as "not installed" and the chart says what
 // to run instead of showing a failed request.
-const MISSING_FUNCTION = "Run sql/migrations/028_add_gross_net_range.sql in Supabase";
+const MISSING_FUNCTION = "Run sql/migrations/033_add_owner_cost_access.sql in Supabase";
 
 function isMissingFunction(error) {
   return (
@@ -64,7 +64,10 @@ export default function GrossNetChart() {
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
-    const { data, error: rpcError } = await supabase.rpc("dashboard_gross_net_range", {
+    // owner_gross_net_range, not dashboard_gross_net_range: `net` is profit,
+    // so migration 034 takes the original away from `authenticated` and this
+    // runs in the browser with the owner's own session.
+    const { data, error: rpcError } = await supabase.rpc("owner_gross_net_range", {
       p_start: startDate,
       p_end: endDate,
       p_bucket: bucket,

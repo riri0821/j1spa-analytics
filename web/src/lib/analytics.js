@@ -16,7 +16,10 @@ export async function getKpis(supabase) {
   // 180 days client-side instead would hit PostgREST's default 1000-row
   // page at real sales volume, with no order-by to make that slice
   // meaningful.
-  const { data } = await supabase.rpc("sales_kpi_summary").single();
+  // owner_* rather than the original: an owner-checked security-definer
+  // function, because migration 034 revokes the cost-bearing originals from
+  // `authenticated` and this runs with the caller's own session.
+  const { data } = await supabase.rpc("owner_sales_kpi_summary").single();
   const curRev = Number(data?.current_revenue ?? 0);
   const curCost = Number(data?.current_cost ?? 0);
   const prevRev = Number(data?.previous_revenue ?? 0);
@@ -35,7 +38,7 @@ export async function getKpis(supabase) {
 // the last 11 month-ends plus today, so the final point tracks the headline
 // tile. Windows with no revenue are dropped rather than plotted as 0%.
 export async function getMarginTrend(supabase) {
-  const { data, error } = await supabase.rpc("dashboard_margin_trend");
+  const { data, error } = await supabase.rpc("owner_margin_trend");
   if (error) console.error("dashboard_margin_trend failed:", error.message);
   return (data ?? [])
     .filter((r) => Number(r.gross) > 0)
@@ -79,28 +82,23 @@ export async function fetchAllRows(query) {
 }
 
 export async function getProductPerformance(supabase) {
-  const [velocity, products] = await Promise.all([
-    fetchAllRows(() =>
-      // .order() is what makes the paging stable - without a sort, each
-      // range request may order rows differently and pages can overlap.
-      supabase.from("vw_product_velocity").select("sku, revenue_90d, units_90d, gross_profit_90d").order("sku")
-    ),
-    fetchAllRows(() =>
-      supabase.from("products").select("sku, name, category, stock_on_hand, reorder_point").eq("is_active", true)
-    ),
-  ]);
-
-  const velBySku = new Map(velocity.map((v) => [v.sku, v]));
+  // One owner-checked function instead of vw_product_velocity joined to
+  // products in here. The view carries gross_profit_90d, so after migration
+  // 034 `authenticated` cannot read it at all and the join has to happen on
+  // the database's side of the owner check.
+  const { data, error } = await supabase.rpc("owner_product_performance");
+  if (error) {
+    console.error("owner_product_performance failed - the Tracking table will be empty:", error.message);
+    return [];
+  }
+  const products = data ?? [];
 
   // top 40% by trailing-90d units are "Fast-moving"
-  const unitsDesc = products
-    .map((p) => Number(velBySku.get(p.sku)?.units_90d ?? 0))
-    .sort((a, b) => b - a);
+  const unitsDesc = products.map((p) => Number(p.units_90d ?? 0)).sort((a, b) => b - a);
   const cutoff = unitsDesc.length ? unitsDesc[Math.floor(unitsDesc.length * 0.4)] : 0;
 
   const rows = products.map((p) => {
-    const v = velBySku.get(p.sku);
-    const units = Number(v?.units_90d ?? 0);
+    const units = Number(p.units_90d ?? 0);
     const movement = units === 0 ? "No recent sales" : units >= Math.max(cutoff, 1) ? "Fast-moving" : "Slow-moving";
 
     let status, severity;
@@ -122,8 +120,8 @@ export async function getProductPerformance(supabase) {
       stockOnHand: p.stock_on_hand,
       reorderPoint: p.reorder_point,
       units90d: Math.round(units),
-      revenue90d: round(Number(v?.revenue_90d ?? 0), 2),
-      grossProfit90d: round(Number(v?.gross_profit_90d ?? 0), 2),
+      revenue90d: round(Number(p.revenue_90d ?? 0), 2),
+      grossProfit90d: round(Number(p.gross_profit_90d ?? 0), 2),
       movement,
       status,
       severity,

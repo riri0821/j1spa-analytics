@@ -1,5 +1,5 @@
 import { requireOwner } from "@/lib/requireOwner";
-import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { toCsv, csvResponse } from "@/lib/csv";
 import { addDays, isValidDate, manilaInstant } from "@/lib/grossNetRange";
 
@@ -40,7 +40,11 @@ export async function GET(request) {
   const startInstant = manilaInstant(start);
   const endExclusive = manilaInstant(addDays(end, 1));
 
-  const supabase = await createClient();
+  // Service-role, not the caller's session: this exports cost columns, and
+  // migration 034 revokes those from `authenticated` - which an owner's
+  // session is too. requireOwner() above is the gate; this is server-side
+  // only and the key never leaves it.
+  const supabase = createAdminClient();
   const { data, error } = await supabase
     .from("sale_items")
     .select("sale_id, sku, quantity, unit_price, unit_cost, line_revenue, products(name), sales!inner(sale_ts, note, status)")

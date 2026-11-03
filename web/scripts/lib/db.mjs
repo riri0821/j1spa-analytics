@@ -35,6 +35,21 @@ function readEnvLocal() {
   return env;
 }
 
+/**
+ * A browser-shaped client on the PUBLISHABLE anon key, with no session.
+ * Used only by scripts/check-staff-access.mjs, which signs in as a
+ * temporary staff user to prove what that session can and cannot reach.
+ * Everything else in scripts/ is a trusted backend and uses the service key.
+ */
+export function createAnonClient() {
+  const env = readEnvLocal();
+  const url = env.NEXT_PUBLIC_SUPABASE_URL;
+  const key = env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
+  if (!url) throw new Error("NEXT_PUBLIC_SUPABASE_URL is not set in web/.env.local");
+  if (!key) throw new Error("NEXT_PUBLIC_SUPABASE_ANON_KEY is not set in web/.env.local");
+  return createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false } });
+}
+
 export function createServiceClient() {
   const env = readEnvLocal();
   const url = env.NEXT_PUBLIC_SUPABASE_URL;

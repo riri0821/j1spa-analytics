@@ -6,7 +6,6 @@ import { theme, CATEGORICAL } from "../dashboard/theme";
 import PaginationControls from "@/components/PaginationControls";
 import RowSizeSelect from "@/components/RowSizeSelect";
 import { usePageSize } from "@/lib/pageSize";
-import { orIlikeFilter } from "@/lib/searchFilter";
 import { CategorySelect, fetchCategoryCounts } from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-2 py-1.5 text-sm w-full";
@@ -44,20 +43,15 @@ export default function ProductsScreen() {
     async (term, category) => {
       setLoading(true);
       setError("");
-      const searchFilter = orIlikeFilter(["name", "sku", "supplier", "category"], term);
-      let query = supabase
-        .from("products")
-        .select(
-          "product_id, sku, name, category, supplier, unit_cost, unit_price, reorder_point, stock_on_hand, is_active"
-        )
-        .order("name")
-        .limit(500);
-
-      if (category) query = query.eq("category", category);
-
-      if (searchFilter) query = query.or(searchFilter);
-
-      const { data, error: fetchError } = await query;
+      // owner_product_catalog, not a direct select: this list shows unit_cost,
+      // which migration 034 revokes from `authenticated` - and the owner's
+      // browser session is `authenticated` too. The search and category
+      // filters move into the function with it, as bound parameters.
+      const { data, error: fetchError } = await supabase.rpc("owner_product_catalog", {
+        p_search: term ?? null,
+        p_category: category || null,
+        p_limit: 500,
+      });
       if (fetchError) setError(fetchError.message);
       else setProducts(data ?? []);
       setLoading(false);

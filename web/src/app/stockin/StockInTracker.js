@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
-import { pagedQuery } from "@/lib/analytics";
 import { theme } from "../dashboard/theme";
 import RecordsTable from "../sales/RecordsTable";
 import { formatManilaDateTime } from "@/lib/ledger";
@@ -32,30 +31,28 @@ export default function StockInTracker() {
       // Both bounds as Manila-time instants, and paged: a busy year holds
       // more than 1000 stock-in rows, which the old single capped request
       // dropped without saying so.
-      const { rows, error: queryError } = await pagedQuery(() =>
-        supabase
-          .from("stock_movements")
-          .select(
-            "movement_id, movement_ts, sku, quantity, balance_after, supplier, unit_cost, reference, profiles(full_name), products(name)"
-          )
-          .eq("movement_type", "stock_in")
-          .gte("movement_ts", startInstant)
-          .lt("movement_ts", endInstantExclusive)
-          .order("movement_id", { ascending: false })
-      );
+      // owner_stockin_log, not a direct select: this reads unit_cost, which
+      // migration 034 revokes from `authenticated`. The function joins the
+      // product name and the recorder itself and returns `spent` already
+      // multiplied out, so no paging is needed either - it returns the whole
+      // window in one call rather than through PostgREST's 1000-row pages.
+      const { data, error: queryError } = await supabase.rpc("owner_stockin_log", {
+        p_start: startInstant,
+        p_end: endInstantExclusive,
+      });
 
       setLoading(false);
       if (queryError) {
-        setError(queryError);
+        setError(queryError.message);
         return;
       }
 
       setRecords(
-        rows.map((r) => ({
+        (data ?? []).map((r) => ({
           ...r,
           key: `movement-${r.movement_id}`,
-          name: r.products?.name ?? r.sku,
-          spent: r.unit_cost != null ? Number(r.unit_cost) * r.quantity : null,
+          name: r.product_name ?? r.sku,
+          profiles: { full_name: r.recorded_by },
         }))
       );
     },
@@ -73,25 +70,16 @@ export default function StockInTracker() {
   async function fetchDetail(row) {
     // Paged, and still deliberately unfiltered by date - this is the SKU's
     // whole stock-in history, so it must not stop at the first 1000 rows.
-    const { rows: history } = await pagedQuery(() =>
-      supabase
-        .from("stock_movements")
-        .select("supplier, quantity, unit_cost")
-        .eq("sku", row.sku)
-        .eq("movement_type", "stock_in")
-        .order("movement_id")
-    );
-
-    const bySupplier = new Map();
-    for (const m of history) {
-      const key = m.supplier || "Unknown";
-      const entry = bySupplier.get(key) ?? { supplier: key, units: 0, spent: 0, batches: 0 };
-      entry.units += m.quantity;
-      entry.spent += m.unit_cost != null ? Number(m.unit_cost) * m.quantity : 0;
-      entry.batches += 1;
-      bySupplier.set(key, entry);
-    }
-    const breakdown = [...bySupplier.values()].sort((a, b) => b.units - a.units);
+    // Aggregated in the database, by owner_stockin_by_supplier. The per-row
+    // unit_cost never leaves it - only the supplier totals come back - and
+    // the whole SKU history is still covered, unfiltered by date, as before.
+    const { data: breakdownRows } = await supabase.rpc("owner_stockin_by_supplier", { p_sku: row.sku });
+    const breakdown = (breakdownRows ?? []).map((b) => ({
+      supplier: b.supplier,
+      units: Number(b.units),
+      spent: Number(b.spent),
+      batches: Number(b.batches),
+    }));
 
     return (
       <>
