@@ -51,6 +51,9 @@ export async function GET(request) {
     .eq("sales.status", "confirmed")
     .gte("sales.sale_ts", startInstant)
     .lt("sales.sale_ts", endExclusive)
+    // sale_ts lives on the embedded `sales`, which PostgREST can only order
+    // within the embed, not across the top-level rows - so the sort is done
+    // below, once each line carries its sale's timestamp.
     .order("sale_id");
 
   if (error) return Response.json({ error: error.message }, { status: 400 });
@@ -66,6 +69,17 @@ export async function GET(request) {
     line_revenue: r.line_revenue,
     note: r.sales?.note,
   }));
+
+  // Chronological, by time rather than by id: the October gap fill gave the
+  // earliest sales in this range the highest sale_ids, so ordering by id put
+  // them last in a CSV that reads as a timeline. sale_id is the tie-break,
+  // which also keeps one sale's lines together.
+  rows.sort((a, b) => {
+    const at = Date.parse(a.date ?? "");
+    const bt = Date.parse(b.date ?? "");
+    if (at !== bt) return at - bt;
+    return a.sale_id - b.sale_id;
+  });
 
   const csv = toCsv(COLUMNS, rows);
   return csvResponse(`sales-${start}-to-${end}.csv`, csv);

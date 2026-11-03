@@ -42,6 +42,11 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
         "sale_id, sale_ts, total_amount, note, user_id, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
       )
       .eq("status", "confirmed")
+      // By time, not by id. The October gap fill inserted rows with the
+      // highest sale_ids and the earliest timestamps, so "highest id" stopped
+      // meaning "most recent" and those sales sat at the top of this list.
+      // sale_id is the tie-break only, for sales in the same second.
+      .order("sale_ts", { ascending: false })
       .order("sale_id", { ascending: false })
       .limit(200);
 

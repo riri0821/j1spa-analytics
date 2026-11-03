@@ -32,6 +32,10 @@ export default function ServicesScreen({ userId, role }) {
         "service_id, service_ts, service_type, total_amount, user_id, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
       )
       .eq("status", "confirmed")
+      // By time, not by id - same reason as the Sales screen: an insert
+      // order that is not the event order makes "highest id" the wrong
+      // answer. service_id is the tie-break only.
+      .order("service_ts", { ascending: false })
       .order("service_id", { ascending: false })
       .limit(200);
 

@@ -62,6 +62,9 @@ export default function SalesTracker({ role }) {
             .eq("status", "confirmed")
             .gte("sale_ts", startInstant)
             .lt("sale_ts", endInstantExclusive)
+            // By time, not by id - see SalesScreen. sale_id is unique, so it
+            // keeps the paging stable as the tie-break.
+            .order("sale_ts", { ascending: false })
             .order("sale_id", { ascending: false })
         ),
         pagedQuery(() =>
@@ -73,6 +76,7 @@ export default function SalesTracker({ role }) {
             .eq("status", "confirmed")
             .gte("service_ts", startInstant)
             .lt("service_ts", endInstantExclusive)
+            .order("service_ts", { ascending: false })
             .order("service_id", { ascending: false })
         ),
       ]);

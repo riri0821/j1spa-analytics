@@ -44,6 +44,10 @@ export async function GET(request) {
     .select("movement_id, movement_ts, sku, movement_type, quantity, balance_after, reference, note, products(name)")
     .gte("movement_ts", startInstant)
     .lt("movement_ts", endExclusive)
+    // Chronological, by time rather than by id: the October gap fill gave
+    // the earliest rows in this range the highest movement_ids, so ordering
+    // by id put them last in a CSV that reads as a timeline.
+    .order("movement_ts")
     .order("movement_id");
 
   if (error) return Response.json({ error: error.message }, { status: 400 });
