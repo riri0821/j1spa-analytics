@@ -1,5 +1,11 @@
 import { NextResponse } from "next/server";
 import { createAdminClient } from "@/lib/supabase/admin";
+import {
+  RESET_QUOTA_PER_EMAIL,
+  RESET_QUOTA_PER_IP,
+  clientIp,
+  consumeQuota,
+} from "@/lib/loginLockout";
 
 // Public route (allow-listed in proxy.js) - unauthenticated visitors must be
 // able to reach this. Only the owner's own email can ever trigger a reset:
@@ -31,6 +37,25 @@ export async function POST(request) {
   }
 
   const admin = createAdminClient();
+
+  // Rate limited BEFORE the owner lookup, and answered with exactly the same
+  // body as every other outcome. Doing it in this order is what keeps the
+  // limiter from becoming an enumeration oracle: the counters move on every
+  // request regardless of whether the address matches anything, so a caller
+  // cannot tell "quota spent" from "wrong email" from "mail sent".
+  //
+  // Unlimited before this, so anyone could loop the endpoint to inbox-bomb
+  // the owner and burn the Resend quota. Three per address and ten per IP
+  // per hour; the per-address one is the limit that has to hold, since
+  // x-forwarded-for is only trustworthy behind the platform edge.
+  // Both counted, not short-circuited: && would skip the IP tally whenever
+  // the address quota was already spent, so hammering one address would
+  // never accrue against the caller's IP.
+  const emailWithinQuota = await consumeQuota(admin, `email:${submitted}`, RESET_QUOTA_PER_EMAIL);
+  const ipWithinQuota = await consumeQuota(admin, `ip:${clientIp(request)}`, RESET_QUOTA_PER_IP);
+  if (!emailWithinQuota || !ipWithinQuota) {
+    return NextResponse.json({ message: GENERIC_MESSAGE });
+  }
 
   const { data: owners } = await admin.from("profiles").select("id").eq("role", "owner").limit(1);
   const ownerId = owners?.[0]?.id;

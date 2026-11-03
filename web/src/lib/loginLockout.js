@@ -96,3 +96,80 @@ export async function recordFailure(admin, identifier) {
 export async function recordSuccess(admin, identifier) {
   await admin.from("login_lockouts").delete().eq("identifier", identifier);
 }
+
+// ---------------------------------------------------------------- quotas
+//
+// A fixed-window request quota, counted in the same table. Used by
+// api/auth/forgot-password, which was an unauthenticated POST with no limit
+// at all: anyone could loop it to inbox-bomb the owner, burn the Resend
+// quota, and make two Supabase admin round trips per call.
+//
+// Deliberately NOT the escalating ladder above. That one exists to slow
+// password guessing, where every attempt is a guess at a secret. Here
+// nothing is being guessed - the limit is on how often the endpoint may be
+// used at all - so a flat "N per hour, then nothing" is the right shape.
+//
+// Identifiers are namespaced ("reset:email:..." / "reset:ip:...") so they
+// cannot collide with the login lockout's own rows, which are bare emails.
+// `fail_count` carries the count and `locked_until` the end of the window.
+
+const RESET_WINDOW_SECONDS = 60 * 60;
+export const RESET_QUOTA_PER_EMAIL = 3;
+export const RESET_QUOTA_PER_IP = 10;
+
+/**
+ * Counts one request against `key`'s quota. Returns true if it is within
+ * quota, false if the quota for the current window is already spent.
+ *
+ * Two simultaneous requests can both read the same count and each write
+ * count+1, so the effective limit can overshoot by the number of requests
+ * in flight. That is an acceptable margin for a quota whose job is to stop
+ * a loop, and the alternative (a locking RPC) is more machinery than this
+ * endpoint warrants.
+ */
+export async function consumeQuota(admin, key, quota) {
+  const identifier = `reset:${key}`;
+  const row = await getRow(admin, identifier);
+  const now = Date.now();
+  const windowOpen = row?.locked_until && new Date(row.locked_until).getTime() > now;
+
+  if (!windowOpen) {
+    // First request of a new window - including the very first ever, and
+    // the case where the previous window has expired.
+    await admin.from("login_lockouts").upsert({
+      identifier,
+      fail_count: 1,
+      locked_until: new Date(now + RESET_WINDOW_SECONDS * 1000).toISOString(),
+      lockout_stage: -1,
+      updated_at: new Date().toISOString(),
+    });
+    return true;
+  }
+
+  if ((row.fail_count ?? 0) >= quota) {
+    // Spent. Not counted again, so hammering the endpoint cannot push the
+    // window's end further out.
+    return false;
+  }
+
+  await admin.from("login_lockouts").upsert({
+    identifier,
+    fail_count: (row.fail_count ?? 0) + 1,
+    locked_until: row.locked_until,
+    lockout_stage: -1,
+    updated_at: new Date().toISOString(),
+  });
+  return true;
+}
+
+/**
+ * Best-effort client IP. On Vercel x-forwarded-for is set by the edge and
+ * its first entry is the real client; anywhere else a client can forge the
+ * header outright, which is why the per-email quota is the one that has to
+ * hold on its own.
+ */
+export function clientIp(request) {
+  const forwarded = request.headers.get("x-forwarded-for");
+  if (forwarded) return forwarded.split(",")[0].trim();
+  return request.headers.get("x-real-ip")?.trim() || "unknown";
+}
