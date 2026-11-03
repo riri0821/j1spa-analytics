@@ -121,6 +121,17 @@ node scripts/check-staff-access.mjs --expect=before   # before 034: cost reads s
 node scripts/check-staff-access.mjs --expect=after    # after 034: they must all fail
 ```
 
+It checks the owner side too, and for the opposite failure. Everything above
+asks what staff cannot reach, which cannot notice an owner screen that is
+simply broken - and that is what migration 036 was: two `owner_*` functions
+erroring on their declared return types, the dashboard and Stock-In Tracker
+empty in production, every staff check green. So a second temporary user is
+created and promoted to owner with the service-role client, and it calls all
+seven `owner_*` functions plus the reads the owner screens do directly. **Rows
+coming back is the bar.** The one real owner account is read before and after
+and compared, and the temporary owner is deleted in the same `finally` block
+with its absence confirmed.
+
 ### Creating accounts
 
 There is deliberately **no code path that creates an owner.** `handle_new_user()`
@@ -215,8 +226,13 @@ web/                        the live application
     verify-cleanup.mjs         read-only checks that each of those did what it
                                 said: chains consistent, no negative balances,
                                 totals as expected
-    check-staff-access.mjs     signs in as a temporary staff user and proves
-                                what that session can and cannot read
+    check-staff-access.mjs     signs in as a temporary staff user, and a
+                                temporary promoted owner, and proves what each
+                                session can and cannot reach - including that
+                                the owner screens come back with ROWS
+    rls-timing.mjs             times the reads whose cost an RLS policy decides
+                                (the stock ledger, Decision Support), as both
+                                roles; how 037 was measured
     simulated-ids.json         the id ranges each run inserted
     backups/                   local only, gitignored: whole customer rows
 
@@ -337,6 +353,24 @@ dry-run count at the top of the file first and check the figures it reports.
 The seed scripts (`backfill-ledger.mjs`, `simulate-recent-activity.mjs`,
 `cleanup-test-data.mjs` and the verifiers) read `data_origin`, so they need 035
 applied before they will run.
+
+`036_fix_owner_function_types.sql` **was applied by hand on 3 Nov**, with the
+owner dashboard and Stock-In Tracker empty in production: two `owner_*`
+functions declared a return type their query did not produce (`units_90d`
+numeric against bigint, `recorded_by` text against `varchar(128)`), and a
+plpgsql `return query` only notices that when it returns a row - so zero rows
+never failed and nothing caught it. The file is the record of the fix and is
+idempotent. Its header carries the audit of the other six `return query`
+functions.
+
+`037_cache_rls_role_lookups.sql` is **new and not yet applied**. It rewrites
+all 18 RLS policies to call `current_user_role()`, `auth.uid()` and
+`auth.role()` inside a scalar subquery, so each is evaluated once per statement
+rather than once per row. Same logic, no table data touched. Before it, a staff
+read of `stock_movements` hit the statement timeout at ~8.2 s rather than
+returning empty, because the policy ran a `profiles` lookup for each of 279,362
+rows; the owner paid the same per-row cost on the stock ledger and Decision
+Support. `037_rollback.sql` puts the direct calls back.
 
 Multi-table writes (`confirm_sale`, `edit_sale`, `undo_sale`, `record_stock_movements`,
 `record_service`, `undo_service`) are Postgres RPC functions: `security definer`,

@@ -415,69 +415,80 @@ alter table login_lockouts     enable row level security;
 
 -- profiles: everyone can read their own row; owners can read every row
 -- (needed for a future staff-management screen).
+-- Every call below is wrapped in a scalar subquery -
+-- `(select current_user_role())`, not `current_user_role()`. Postgres
+-- re-evaluates a bare call in a row filter FOR EVERY ROW; wrapped, it
+-- becomes an InitPlan evaluated once per statement. current_user_role() is
+-- itself `select role from profiles where id = auth.uid()`, so the bare form
+-- meant a profiles lookup per row - and a staff read of stock_movements'
+-- 279,362 rows hit the statement timeout instead of returning empty. Same
+-- logic throughout, including for a caller with no profile row, where both
+-- forms are NULL and a NULL policy denies. See
+-- sql/migrations/037_cache_rls_role_lookups.sql, and 037_rollback.sql.
+
 create policy "profiles_select" on profiles for select
-  using (auth.uid() = id or current_user_role() = 'owner');
+  using ((select auth.uid()) = id or (select current_user_role()) = 'owner');
 
 -- products: any signed-in user can read; only owners can write.
 create policy "products_select" on products for select
-  using (auth.role() = 'authenticated');
+  using ((select auth.role()) = 'authenticated');
 create policy "products_write" on products for all
-  using (current_user_role() = 'owner')
-  with check (current_user_role() = 'owner');
+  using ((select current_user_role()) = 'owner')
+  with check ((select current_user_role()) = 'owner');
 
 -- sales / sale_items: any signed-in user can read and insert (both roles
 -- record sales); only owners can update or delete (e.g. voiding a sale).
 -- stock_movements is read by both roles but inserted only by the owner -
 -- staff sales reach it through security-definer functions instead.
 create policy "sales_select" on sales for select
-  using (auth.role() = 'authenticated');
+  using ((select auth.role()) = 'authenticated');
 create policy "sales_insert" on sales for insert
-  with check (auth.role() = 'authenticated');
+  with check ((select auth.role()) = 'authenticated');
 create policy "sales_owner_write" on sales for update
-  using (current_user_role() = 'owner');
+  using ((select current_user_role()) = 'owner');
 
 create policy "sale_items_select" on sale_items for select
-  using (auth.role() = 'authenticated');
+  using ((select auth.role()) = 'authenticated');
 create policy "sale_items_insert" on sale_items for insert
-  with check (auth.role() = 'authenticated');
+  with check ((select auth.role()) = 'authenticated');
 
 create policy "stock_movements_select" on stock_movements for select
-  using (current_user_role() = 'owner');
+  using ((select current_user_role()) = 'owner');
 -- inserts are owner-only: staff sales/voids reach this table through the
 -- security-definer functions (confirm_sale, undo_sale, edit_sale), which
 -- bypass RLS, so staff never need direct insert rights. See
 -- sql/migrations/026_fix_stockin_owner_only.sql.
 create policy "stock_movements_insert" on stock_movements for insert
-  with check (current_user_role() = 'owner');
+  with check ((select current_user_role()) = 'owner');
 -- owners can reassign user_id when deleting a staff account
 create policy "stock_movements_owner_write" on stock_movements for update
-  using (current_user_role() = 'owner');
+  using ((select current_user_role()) = 'owner');
 
 -- services: same shape as sales - any signed-in user can read/insert,
 -- only owners can update (voiding a service record).
 create policy "services_select" on services for select
-  using (auth.role() = 'authenticated');
+  using ((select auth.role()) = 'authenticated');
 create policy "services_insert" on services for insert
-  with check (auth.role() = 'authenticated');
+  with check ((select auth.role()) = 'authenticated');
 create policy "services_owner_write" on services for update
-  using (current_user_role() = 'owner');
+  using ((select current_user_role()) = 'owner');
 
 -- alerts: read-only for everyone signed in; written by the owner-triggered
 -- rules engine (Decision Support screen).
 create policy "alerts_select" on alerts for select
-  using (current_user_role() = 'owner');
+  using ((select current_user_role()) = 'owner');
 create policy "alerts_insert" on alerts for insert
-  with check (current_user_role() = 'owner');
+  with check ((select current_user_role()) = 'owner');
 
 -- advisory_overrides: same shape as products - any signed-in user can
 -- read, only owners can write.
 drop policy if exists "advisory_overrides_select" on advisory_overrides;
 create policy "advisory_overrides_select" on advisory_overrides for select
-  using (current_user_role() = 'owner');
+  using ((select current_user_role()) = 'owner');
 drop policy if exists "advisory_overrides_write" on advisory_overrides;
 create policy "advisory_overrides_write" on advisory_overrides for all
-  using (current_user_role() = 'owner')
-  with check (current_user_role() = 'owner');
+  using ((select current_user_role()) = 'owner')
+  with check ((select current_user_role()) = 'owner');
 
 -- =====================================================================
 --  RPC functions for atomic multi-table writes.
