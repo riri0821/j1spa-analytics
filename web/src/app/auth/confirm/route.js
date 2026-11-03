@@ -9,7 +9,14 @@ export async function GET(request) {
   const { searchParams, origin } = new URL(request.url);
   const token_hash = searchParams.get("token_hash");
   const type = searchParams.get("type");
-  const next = searchParams.get("next") || "/reset-password";
+  // Same-origin paths only. `${origin}${next}` with next="@evil.com" builds
+  // https://app.example.com@evil.com - where the app's own host is parsed as
+  // userinfo and the browser goes to evil.com - and a protocol-relative
+  // "//evil.com" is the same trick. A path it is, or the default.
+  const requested = searchParams.get("next");
+  const next = requested && requested.startsWith("/") && !requested.startsWith("//")
+    ? requested
+    : "/reset-password";
 
   if (token_hash && type) {
     const supabase = await createClient();
