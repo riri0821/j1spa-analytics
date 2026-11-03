@@ -8,6 +8,7 @@ import ServicesScreen from "./ServicesScreen";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
 import { formatManilaDateTime } from "@/lib/ledger";
 import { fetchProfileNames, cashierName } from "@/lib/profileNames";
+import { todayInManila } from "@/lib/grossNetRange";
 import CategoryProductPicker from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
@@ -74,13 +75,24 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
       lineCounts[it.sale_id] = (lineCounts[it.sale_id] ?? 0) + 1;
     });
 
-    const today = new Date().toDateString();
+    // The shop's day, not the browser's. toDateString() reads the local
+    // clock, so a staff member on a laptop set to another timezone was shown
+    // Undo on sales undo_sale would refuse, and denied it on sales it would
+    // have allowed - around midnight Manila, on their own sales.
+    const today = todayInManila();
     setRecentSales(
       list.map((s) => ({
         ...s,
         lines: lineCounts[s.sale_id] ?? 0,
         cashier: cashierName(names, s.user_id),
-        can_undo: role === "owner" || (s.user_id === userId && new Date(s.sale_ts).toDateString() === today),
+        // undo_sale: the owner, or your own sale from the current Manila day.
+        can_undo:
+          role === "owner" ||
+          (s.user_id === userId && todayInManila(new Date(s.sale_ts)) === today),
+        // edit_sale: the owner, or your own sale - it has no same-day limit,
+        // so neither does the link. Tightening one without the other is what
+        // puts a dead link on the screen.
+        can_edit: role === "owner" || s.user_id === userId,
       }))
     );
   }, [supabase, role, userId]);

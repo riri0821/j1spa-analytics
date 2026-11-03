@@ -149,7 +149,16 @@ export default function RecordsTable({
                     </td>
                   ))}
                   <td className="px-3 py-2 text-right whitespace-nowrap">
-                    {onEdit && (
+                    {/*
+                      Both links are per row, not per table. edit_sale and
+                      undo_sale decide for themselves whether the caller may
+                      touch a given sale, so a link shown on a row they may
+                      not change is an offer the database then refuses - the
+                      user finds out by being told no. can_edit and can_undo
+                      are set where the rows are loaded, against the same
+                      rules those functions use.
+                    */}
+                    {onEdit && r.can_edit && (
                       <button
                         onClick={() => onEdit(r)}
                         className="mr-3 hover:underline"

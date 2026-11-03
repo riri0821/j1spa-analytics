@@ -5,6 +5,7 @@ import { createClient } from "@/lib/supabase/client";
 import { theme } from "../dashboard/theme";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
 import { fetchProfileNames, cashierName } from "@/lib/profileNames";
+import { todayInManila } from "@/lib/grossNetRange";
 import { formatManilaDateTime } from "@/lib/ledger";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
@@ -44,13 +45,17 @@ export default function ServicesScreen({ userId, role }) {
     // src/lib/profileNames.js.
     const { names } = await fetchProfileNames(supabase);
 
-    const today = new Date().toDateString();
+    // Manila's day, not the browser's - same as the Sales screen, and for
+    // the same reason: undo_service compares in Asia/Manila.
+    const today = todayInManila();
     setRecentServices(
       (data ?? []).map((s) => ({
         ...s,
         key: s.service_id,
         cashier: cashierName(names, s.user_id),
-        can_undo: role === "owner" || (s.user_id === userId && new Date(s.service_ts).toDateString() === today),
+        can_undo:
+          role === "owner" ||
+          (s.user_id === userId && todayInManila(new Date(s.service_ts)) === today),
       }))
     );
   }, [supabase, role, userId]);
