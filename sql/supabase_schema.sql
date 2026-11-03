@@ -282,7 +282,11 @@ create table login_lockouts (
 --  scheduled refresh — still no app-level scheduler needed.
 -- =====================================================================
 
-create view vw_daily_sales as
+-- security_invoker: a view is NOT subject to the RLS of the tables under
+-- it. Since PG15 it runs as its OWNER unless this is set, and the owner
+-- here is `postgres`, which bypasses RLS - so without it the publishable
+-- anon key could read this view's figures with no login.
+create view vw_daily_sales with (security_invoker = true) as
 select
   s.sale_ts::date                       as full_date,
   extract(year  from s.sale_ts)::int    as year,
@@ -308,7 +312,11 @@ where s.status = 'confirmed'
 group by s.sale_ts::date, year, quarter, month, month_name, day_name,
          is_weekend, p.sku, p.name, p.category, p.brand, p.supplier, p.source_type;
 
-create view vw_monthly_sales as
+-- security_invoker: a view is NOT subject to the RLS of the tables under
+-- it. Since PG15 it runs as its OWNER unless this is set, and the owner
+-- here is `postgres`, which bypasses RLS - so without it the publishable
+-- anon key could read this view's figures with no login.
+create view vw_monthly_sales with (security_invoker = true) as
 select
   extract(year  from s.sale_ts)::int as year,
   extract(month from s.sale_ts)::int as month,
@@ -325,7 +333,11 @@ join products p on p.product_id = si.product_id
 where s.status = 'confirmed'
 group by year, month, p.sku, p.name, p.category;
 
-create view vw_product_velocity as
+-- security_invoker: a view is NOT subject to the RLS of the tables under
+-- it. Since PG15 it runs as its OWNER unless this is set, and the owner
+-- here is `postgres`, which bypasses RLS - so without it the publishable
+-- anon key could read this view's figures with no login.
+create view vw_product_velocity with (security_invoker = true) as
 select
   p.sku,
   p.name     as product_name,
@@ -554,7 +566,8 @@ end;
 $$;
 
 revoke execute on function confirm_sale(jsonb, text, text, text, text, text) from public;
-grant execute on function confirm_sale(jsonb, text, text, text, text, text) to authenticated;
+revoke execute on function confirm_sale(jsonb, text, text, text, text, text) from anon;
+grant execute on function confirm_sale(jsonb, text, text, text, text, text) to authenticated, service_role;
 
 create or replace function undo_sale(p_sale_id bigint)
 returns jsonb
@@ -608,7 +621,8 @@ end;
 $$;
 
 revoke execute on function undo_sale(bigint) from public;
-grant execute on function undo_sale(bigint) to authenticated;
+revoke execute on function undo_sale(bigint) from anon;
+grant execute on function undo_sale(bigint) to authenticated, service_role;
 
 -- edit_sale(): corrects a confirmed sale's line items/note/customer info
 -- in place (owner: any sale; staff: only their own, no same-day limit,
@@ -745,7 +759,8 @@ end;
 $$;
 
 revoke execute on function edit_sale(bigint, jsonb, text, text, text, text, text) from public;
-grant execute on function edit_sale(bigint, jsonb, text, text, text, text, text) to authenticated;
+revoke execute on function edit_sale(bigint, jsonb, text, text, text, text, text) from anon;
+grant execute on function edit_sale(bigint, jsonb, text, text, text, text, text) to authenticated, service_role;
 
 -- Services: manual entry, no inventory/stock involvement, so no locking
 -- or line items - just a stamped record of what was recorded and by whom.
@@ -796,7 +811,8 @@ end;
 $$;
 
 revoke execute on function record_service(text, numeric, text, text, text, text) from public;
-grant execute on function record_service(text, numeric, text, text, text, text) to authenticated;
+revoke execute on function record_service(text, numeric, text, text, text, text) from anon;
+grant execute on function record_service(text, numeric, text, text, text, text) to authenticated, service_role;
 
 create or replace function undo_service(p_service_id bigint)
 returns jsonb
@@ -836,7 +852,8 @@ end;
 $$;
 
 revoke execute on function undo_service(bigint) from public;
-grant execute on function undo_service(bigint) to authenticated;
+revoke execute on function undo_service(bigint) from anon;
+grant execute on function undo_service(bigint) to authenticated, service_role;
 
 -- set_product_supplier: lets any signed-in profile (not just owner) tag a
 -- product's supplier - an operational label like reference/note, not a
@@ -877,7 +894,8 @@ end;
 $$;
 
 revoke execute on function set_product_supplier(bigint, text) from public;
-grant execute on function set_product_supplier(bigint, text) to authenticated;
+revoke execute on function set_product_supplier(bigint, text) from anon;
+grant execute on function set_product_supplier(bigint, text) to authenticated, service_role;
 
 create or replace function record_stock_movements(items jsonb, reference text default null, supplier text default null)
 returns jsonb
@@ -978,7 +996,8 @@ end;
 $$;
 
 revoke execute on function record_stock_movements(jsonb, text, text) from public;
-grant execute on function record_stock_movements(jsonb, text, text) to authenticated;
+revoke execute on function record_stock_movements(jsonb, text, text) from anon;
+grant execute on function record_stock_movements(jsonb, text, text) to authenticated, service_role;
 
 -- Read-only, no security definer needed: authenticated already has SELECT
 -- on sale_items/sales/products via the RLS policies above, and the
@@ -1001,6 +1020,8 @@ as $$
   order by year, month;
 $$;
 
+revoke execute on function monthly_demand(text) from public;
+revoke execute on function monthly_demand(text) from anon;
 grant execute on function monthly_demand(text) to authenticated, service_role;
 
 -- Same idea as monthly_demand(), but for every SKU in one query - used by
@@ -1023,6 +1044,8 @@ as $$
   order by p.sku, year, month;
 $$;
 
+revoke execute on function monthly_demand_all() from public;
+revoke execute on function monthly_demand_all() from anon;
 grant execute on function monthly_demand_all() to authenticated, service_role;
 
 -- Shop-wide monthly totals for the dashboard's Sales Volume Heatmap, grouped
@@ -1049,6 +1072,8 @@ as $$
   order by year, month;
 $$;
 
+revoke execute on function monthly_sales_totals() from public;
+revoke execute on function monthly_sales_totals() from anon;
 grant execute on function monthly_sales_totals() to authenticated, service_role;
 
 -- Current-vs-previous-90-day revenue/cost totals for the dashboard's Gross
@@ -1086,6 +1111,8 @@ as $$
   from combined;
 $$;
 
+revoke execute on function sales_kpi_summary() from public;
+revoke execute on function sales_kpi_summary() from anon;
 grant execute on function sales_kpi_summary() to authenticated, service_role;
 
 -- Dashboard's Gross & Net chart: combines sales (which have a cost, so
@@ -1211,6 +1238,8 @@ begin
 end;
 $$;
 
+revoke execute on function dashboard_gross_net_summary(text, integer) from public;
+revoke execute on function dashboard_gross_net_summary(text, integer) from anon;
 grant execute on function dashboard_gross_net_summary(text, integer) to authenticated, service_role;
 
 -- dashboard_gross_net_range(): the same revenue definition as
@@ -1301,6 +1330,8 @@ begin
 end;
 $$;
 
+revoke execute on function dashboard_gross_net_range(date, date, text) from public;
+revoke execute on function dashboard_gross_net_range(date, date, text) from anon;
 grant execute on function dashboard_gross_net_range(date, date, text) to authenticated, service_role;
 
 
@@ -1350,5 +1381,21 @@ as $$
   order by points.p asc;
 $$;
 
+revoke execute on function dashboard_margin_trend() from public;
+revoke execute on function dashboard_margin_trend() from anon;
 grant execute on function dashboard_margin_trend() to authenticated, service_role;
 
+-- =====================================================================
+--  Default privileges.
+--
+--  Postgres grants EXECUTE on a newly created function to PUBLIC, and
+--  Supabase's `anon` role is a member of PUBLIC - so every function above
+--  revokes it explicitly. These two lines stop the NEXT function added to
+--  this schema from arriving with that grant in the first place, which is
+--  the failure the explicit revokes are papering over.
+--
+--  See sql/migrations/031_fix_audit_batch_1.sql.
+-- =====================================================================
+
+alter default privileges in schema public revoke execute on functions from anon;
+alter default privileges in schema public revoke execute on functions from public;
