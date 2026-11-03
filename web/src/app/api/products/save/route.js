@@ -25,14 +25,32 @@ export async function POST(request) {
     return NextResponse.json({ error: "SKU and name are required." }, { status: 400 });
   }
 
+  // Negatives are rejected rather than coerced through. A unit_cost of -500
+  // makes gross profit exceed revenue everywhere it is computed - the KPI
+  // tiles, the margin trend, Gross & Net, the velocity view, Decision
+  // Support - with nothing on screen to flag it. This is the message the
+  // owner sees; the check constraints in
+  // sql/migrations/031_fix_audit_batch_1.sql are the backstop underneath.
+  // A non-numeric value still falls back to 0, as it always did.
+  const numeric = {
+    unit_cost: Number(body.unit_cost) || 0,
+    unit_price: Number(body.unit_price) || 0,
+    reorder_point: Number(body.reorder_point) || 0,
+  };
+  const negative = Object.keys(numeric).find((k) => numeric[k] < 0);
+  if (negative) {
+    return NextResponse.json(
+      { error: `${negative.replace(/_/g, " ")} cannot be negative.` },
+      { status: 400 }
+    );
+  }
+
   const values = {
     sku,
     name,
     category: (body.category ?? "").trim() || "Uncategorized",
     supplier: (body.supplier ?? "").trim() || "Unknown",
-    unit_cost: Number(body.unit_cost) || 0,
-    unit_price: Number(body.unit_price) || 0,
-    reorder_point: Number(body.reorder_point) || 0,
+    ...numeric,
     is_active: !!body.is_active,
   };
   // brand has no field in this form anymore (replaced by supplier) - only
