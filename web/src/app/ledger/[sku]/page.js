@@ -1,10 +1,11 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
-import { buildLedger, formatManilaDate, manilaDayStart, parseDateParam } from "@/lib/ledger";
+import { buildLedger, formatManilaDate, manilaDayStart, paginateLedger, parseDateParam } from "@/lib/ledger";
 import { theme, CATEGORICAL, DELTA_DOWN, DELTA_UP } from "../../dashboard/theme";
 import Sidebar from "../../dashboard/Sidebar";
 import Card from "../../dashboard/Card";
 import LedgerDateFilter from "./LedgerDateFilter";
+import LedgerPagination from "./LedgerPagination";
 
 // PostgREST caps a response at 1000 rows, so a long-lived product's history
 // has to be paged through - a single select would silently stop at the cap
@@ -85,6 +86,9 @@ export default async function LedgerPage({ params, searchParams }) {
   const names = new Map((staff ?? []).map((s) => [s.id, s.full_name]));
 
   const ledger = buildLedger({ product, movements, from, to, names });
+  // Only the rendering is paged: every balance, total and warning below is
+  // computed from the whole selected period.
+  const view = paginateLedger(ledger, query.page);
 
   // Only meaningful for an open-ended period: with a "To" date the ledger
   // stops before today's movements, so a mismatch there is expected.
@@ -148,6 +152,21 @@ export default async function LedgerPage({ params, searchParams }) {
             </p>
           )}
 
+          {ledger.rows.length > 0 && (
+            <div className="flex justify-end">
+              <LedgerPagination
+                sku={product.sku}
+                from={from}
+                to={to}
+                page={view.page}
+                totalPages={view.totalPages}
+                rangeStart={view.rangeStart}
+                rangeEnd={view.rangeEnd}
+                total={view.total}
+              />
+            </div>
+          )}
+
           <div className="overflow-x-auto rounded-lg border" style={{ borderColor: theme.border }}>
             <table className="w-full text-left text-sm">
               <thead>
@@ -162,23 +181,20 @@ export default async function LedgerPage({ params, searchParams }) {
                 </tr>
               </thead>
               <tbody>
-                <tr className="border-t" style={{ borderColor: theme.border }}>
-                  <td className="px-3 py-2" style={{ color: theme.textSecondary }}>
-                    {ledger.beginningDateLabel}
-                  </td>
-                  <td className="px-3 py-2 font-medium" style={{ color: theme.textPrimary }}>
-                    Beginning balance
-                  </td>
-                  <td className="px-3 py-2" />
-                  <td className="px-3 py-2" />
-                  <td className="px-3 py-2" />
-                  <td className="px-3 py-2 text-right font-medium tabular-nums" style={{ color: theme.textPrimary }}>
-                    {ledger.beginningBalance}
-                  </td>
-                  <td className="px-3 py-2" />
-                </tr>
+                {/* A stock card opens either at the period's own beginning
+                    balance, or - from the second page on - at whatever the
+                    page before it closed on. */}
+                {view.isFirstPage ? (
+                  <MarkerRow
+                    dateLabel={ledger.beginningDateLabel}
+                    label="Beginning balance"
+                    balance={ledger.beginningBalance}
+                  />
+                ) : (
+                  <MarkerRow label="Balance brought forward" balance={view.broughtForward} />
+                )}
 
-                {ledger.rows.map((r) => (
+                {view.rows.map((r) => (
                   <tr key={r.movementId} className="border-t" style={{ borderColor: theme.border }}>
                     <td className="px-3 py-2 whitespace-nowrap" style={{ color: theme.textSecondary }}>
                       {r.dateLabel}
@@ -204,23 +220,31 @@ export default async function LedgerPage({ params, searchParams }) {
                   </tr>
                 ))}
 
-                <tr className="border-t" style={{ borderColor: theme.border, backgroundColor: theme.cardBgAlt }}>
-                  <td className="px-3 py-2" />
-                  <td className="px-3 py-2 font-medium" style={{ color: theme.textPrimary }}>
-                    Total transactions as of {ledger.asOfLabel}
-                  </td>
-                  <td className="px-3 py-2" />
-                  <td className="px-3 py-2 text-right font-medium tabular-nums" style={{ color: DELTA_UP }}>
-                    {ledger.totalIn}
-                  </td>
-                  <td className="px-3 py-2 text-right font-medium tabular-nums" style={{ color: DELTA_DOWN }}>
-                    {ledger.totalOut}
-                  </td>
-                  <td className="px-3 py-2 text-right font-medium tabular-nums" style={{ color: theme.textPrimary }}>
-                    {ledger.endingBalance}
-                  </td>
-                  <td className="px-3 py-2" />
-                </tr>
+                {!view.isLastPage && (
+                  <MarkerRow label="Balance carried forward" balance={view.carriedForward} />
+                )}
+
+                {/* The totals close the period, not the page, so they belong
+                    on the last page only - and they stay period-wide. */}
+                {view.isLastPage && (
+                  <tr className="border-t" style={{ borderColor: theme.border, backgroundColor: theme.cardBgAlt }}>
+                    <td className="px-3 py-2" />
+                    <td className="px-3 py-2 font-medium" style={{ color: theme.textPrimary }}>
+                      Total transactions as of {ledger.asOfLabel}
+                    </td>
+                    <td className="px-3 py-2" />
+                    <td className="px-3 py-2 text-right font-medium tabular-nums" style={{ color: DELTA_UP }}>
+                      {ledger.totalIn}
+                    </td>
+                    <td className="px-3 py-2 text-right font-medium tabular-nums" style={{ color: DELTA_DOWN }}>
+                      {ledger.totalOut}
+                    </td>
+                    <td className="px-3 py-2 text-right font-medium tabular-nums" style={{ color: theme.textPrimary }}>
+                      {ledger.endingBalance}
+                    </td>
+                    <td className="px-3 py-2" />
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -233,6 +257,30 @@ export default async function LedgerPage({ params, searchParams }) {
         </div>
       </Card>
     </Shell>
+  );
+}
+
+// The non-movement lines of the stock card - beginning balance, and the
+// brought/carried forward pair that joins one page to the next. All three
+// share this markup so a carry line cannot drift into looking like a real
+// movement: no quantities, no supplier, no recorder.
+function MarkerRow({ dateLabel, label, balance }) {
+  return (
+    <tr className="border-t" style={{ borderColor: theme.border }}>
+      <td className="px-3 py-2" style={{ color: theme.textSecondary }}>
+        {dateLabel}
+      </td>
+      <td className="px-3 py-2 font-medium" style={{ color: theme.textPrimary }}>
+        {label}
+      </td>
+      <td className="px-3 py-2" />
+      <td className="px-3 py-2" />
+      <td className="px-3 py-2" />
+      <td className="px-3 py-2 text-right font-medium tabular-nums" style={{ color: theme.textPrimary }}>
+        {balance}
+      </td>
+      <td className="px-3 py-2" />
+    </tr>
   );
 }
 

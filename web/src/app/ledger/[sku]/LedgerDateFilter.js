@@ -13,6 +13,10 @@ export default function LedgerDateFilter({ sku, from, to }) {
 
   function apply(next) {
     setRange(next);
+    // Built from scratch, which deliberately drops any ?page= - a new range
+    // has a different number of pages, so an old page number means nothing
+    // in it. Leaving it out returns the ledger to its default view, the last
+    // page. Do not carry the existing params over here.
     const params = new URLSearchParams();
     if (next.from) params.set("from", next.from);
     if (next.to) params.set("to", next.to);

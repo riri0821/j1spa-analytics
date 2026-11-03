@@ -3,7 +3,8 @@
  * opening balance, one row per stock movement, and the closing totals.
  * Read-only - everything here is derived from rows already written by
  * confirm_sale / undo_sale / edit_sale / record_stock_movements, plus the
- * opening row api/products/save writes for a new product.
+ * opening row api/products/save writes for a new product. Also paginates
+ * those rows into ledger-card pages (see LEDGER_PAGE_SIZE below).
  *
  * Checked by web/scripts/ledger.check.mjs (`npm run check:ledger`).
  */
@@ -186,5 +187,91 @@ export function buildLedger({ product, movements, from, to, names }) {
     totalOut,
     endingBalance,
     asOfLabel: formatManilaDate(to ? manilaDayStart(to) : new Date()),
+  };
+}
+
+// ---------------------------------------------------------------------- paging
+
+/**
+ * Movement rows per page on /ledger/[sku]. Every balance and total is still
+ * computed from the whole period (see buildLedger) - paging only decides how
+ * much of `ledger.rows` is rendered at once.
+ */
+export const LEDGER_PAGE_SIZE = 10;
+
+export function ledgerPageCount(rowCount, pageSize = LEDGER_PAGE_SIZE) {
+  // An empty period is still one page: it has a beginning balance and a
+  // totals line to show, so there is never a "page 0".
+  return Math.max(1, Math.ceil(rowCount / pageSize));
+}
+
+function pageNumberFrom(value) {
+  if (typeof value === "number") return value;
+  // A blank ?page= is "no page asked for", not page 0 - Number("") is 0.
+  if (typeof value !== "string" || value.trim() === "") return NaN;
+  return Number(value);
+}
+
+/**
+ * The page to actually render for a `?page=` value.
+ *
+ * No value, or one that is not a whole number at all ('abc', '2.5', a
+ * repeated param arriving as an array), falls back to the default view: the
+ * LAST page, so the link lands on the most recent activity. A real number
+ * outside the range is clamped to the nearest end - 0 and negatives to the
+ * first page, anything past the end to the last one - so a stale bookmark
+ * still renders a ledger instead of an empty table.
+ */
+export function clampLedgerPage(value, rowCount, pageSize = LEDGER_PAGE_SIZE) {
+  const totalPages = ledgerPageCount(rowCount, pageSize);
+  const asked = pageNumberFrom(value);
+  if (!Number.isInteger(asked)) return totalPages;
+  return Math.min(Math.max(asked, 1), totalPages);
+}
+
+/**
+ * Slices one page out of a built ledger and works out the carry lines that
+ * make the pages read like a manual stock card:
+ *
+ *   - `broughtForward` - the balance the previous page ended on, shown at the
+ *     top of every page but the first (the first page shows the period's
+ *     beginning balance instead).
+ *   - `carriedForward` - the balance this page ends on, shown at the bottom of
+ *     every page but the last (the last page shows the period totals instead).
+ *
+ * Both are read off the movement rows themselves, so they are the same
+ * balance_after figures the movement lines above and below them show.
+ *
+ * @param ledger the result of buildLedger - only `rows` is read.
+ * @param page the raw `?page=` value; clamped here, never trusted.
+ */
+export function paginateLedger(ledger, page, pageSize = LEDGER_PAGE_SIZE) {
+  const all = ledger.rows;
+  const total = all.length;
+  const totalPages = ledgerPageCount(total, pageSize);
+  const current = clampLedgerPage(page, total, pageSize);
+
+  const start = (current - 1) * pageSize;
+  const end = Math.min(start + pageSize, total);
+  const rows = all.slice(start, end);
+
+  const previousRow = start > 0 ? all[start - 1] : null;
+  const lastRow = rows.length > 0 ? rows[rows.length - 1] : null;
+  const isLastPage = current === totalPages;
+
+  return {
+    page: current,
+    totalPages,
+    pageSize,
+    rows,
+    total,
+    // 1-based and inclusive, for "Rows 11-20 of 1,165". An empty period has
+    // no rows to number, so it reads 0-0.
+    rangeStart: total === 0 ? 0 : start + 1,
+    rangeEnd: end,
+    isFirstPage: current === 1,
+    isLastPage,
+    broughtForward: previousRow ? previousRow.balance : null,
+    carriedForward: !isLastPage && lastRow ? lastRow.balance : null,
   };
 }
