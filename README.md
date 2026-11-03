@@ -38,6 +38,30 @@ the fly rather than a separately-synced star schema.
 Enforced both at the page level (role check + redirect) and at the database level
 (Postgres Row Level Security policies) — not just hidden in the UI.
 
+### Creating accounts
+
+There is deliberately **no code path that creates an owner.** `handle_new_user()`
+always writes `role = 'staff'`, ignoring any role in the sign-up metadata — that
+metadata is supplied by whoever makes the sign-up request, so trusting it let a
+single `/auth/v1/signup` call mint its own owner account. Promote the owner by hand,
+once, in the Supabase SQL editor:
+
+```sql
+update profiles set role = 'owner' where username = 'you@example.com';
+```
+
+Two settings that matter:
+
+* **"Allow new users to sign up" must be OFF** in Supabase → Authentication →
+  Sign In / Providers. Staff accounts are created by the owner through `/settings`
+  (service-role), which doesn't need public sign-up; leaving it on lets anyone
+  create a working staff login against the project's anon key.
+* `profiles` has **no update policy**. RLS has no column-level grain, so a
+  self-service "update your own profile" policy also covered `role` — see
+  `sql/migrations/021_fix_profiles_role_escalation.sql`. The only write to
+  `profiles` in the whole app is `api/settings/toggle-user`, which uses the
+  service-role client and bypasses RLS.
+
 ---
 
 ## 3. Project layout

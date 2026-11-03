@@ -86,9 +86,12 @@ create table profiles (
 -- Role/username/full_name come from the signup call's `options.data`
 -- (see web/src/app/login) - if that's missing (e.g. a user added by hand
 -- from the Supabase dashboard, which has no such field), it falls back to
--- the email's local part and defaults role to 'staff'. To make your own
--- account the owner: create yourself as a user in the dashboard, then run
+-- the email's local part. Role is ALWAYS 'staff' - there is deliberately no
+-- code path anywhere that creates an owner. To make your own account the
+-- owner: create yourself as a user in the dashboard, then run
 --   update profiles set role = 'owner' where username = 'you@example.com';
+-- Keep "Allow new users to sign up" OFF in Supabase Auth settings; staff
+-- accounts are created by the owner through /settings instead.
 create or replace function public.handle_new_user()
 returns trigger
 language plpgsql
@@ -101,7 +104,11 @@ begin
     new.id,
     coalesce(new.raw_user_meta_data ->> 'username', split_part(new.email, '@', 1)),
     coalesce(new.raw_user_meta_data ->> 'full_name', split_part(new.email, '@', 1)),
-    coalesce((new.raw_user_meta_data ->> 'role')::user_role, 'staff')
+    -- Hard-coded, NOT read from raw_user_meta_data: that metadata is
+    -- supplied by whoever makes the sign-up request, so reading a role out
+    -- of it let a /auth/v1/signup call create its own owner account. See
+    -- sql/migrations/021_fix_profiles_role_escalation.sql.
+    'staff'
   );
   return new;
 end;
@@ -368,8 +375,6 @@ alter table login_lockouts     enable row level security;
 -- (needed for a future staff-management screen).
 create policy "profiles_select" on profiles for select
   using (auth.uid() = id or current_user_role() = 'owner');
-create policy "profiles_update_own" on profiles for update
-  using (auth.uid() = id);
 
 -- products: any signed-in user can read; only owners can write.
 create policy "products_select" on products for select
