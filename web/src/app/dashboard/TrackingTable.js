@@ -84,7 +84,7 @@ export default function TrackingTable({ rows }) {
               <th className="px-3 py-2 font-normal">Movement</th>
               {/* "Balance" rather than "Stock level" so it reads as the same
                   figure as the Balance column in the ledger this SKU opens. */}
-              <th className="px-3 py-2 text-right font-normal">Balance</th>
+              <th className="w-24 px-3 py-2 text-center font-normal">Balance</th>
               <th className="px-3 py-2 font-normal">Status</th>
             </tr>
           </thead>
@@ -105,7 +105,7 @@ export default function TrackingTable({ rows }) {
                 <td className="px-3 py-2" style={{ color: theme.textSecondary }}>
                   {r.movement}
                 </td>
-                <td className="px-3 py-2 text-right tabular-nums" style={{ color: theme.textSecondary }}>
+                <td className="px-3 py-2 text-center tabular-nums" style={{ color: theme.textSecondary }}>
                   {r.stockOnHand}
                 </td>
                 <td className="px-3 py-2">
