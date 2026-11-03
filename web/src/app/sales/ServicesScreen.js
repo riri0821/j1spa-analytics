@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { theme } from "../dashboard/theme";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
+import { fetchProfileNames, cashierName } from "@/lib/profileNames";
 import { formatManilaDateTime } from "@/lib/ledger";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
@@ -29,7 +30,7 @@ export default function ServicesScreen({ userId, role }) {
     const { data } = await supabase
       .from("services")
       .select(
-        "service_id, service_ts, service_type, total_amount, user_id, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
+        "service_id, service_ts, service_type, total_amount, user_id, customer_name, customer_contact, customer_address, customer_vehicle_brand"
       )
       .eq("status", "confirmed")
       // By time, not by id - same reason as the Sales screen: an insert
@@ -39,11 +40,16 @@ export default function ServicesScreen({ userId, role }) {
       .order("service_id", { ascending: false })
       .limit(200);
 
+    // From profile_names(), not an embedded profiles(full_name) - see
+    // src/lib/profileNames.js.
+    const { names } = await fetchProfileNames(supabase);
+
     const today = new Date().toDateString();
     setRecentServices(
       (data ?? []).map((s) => ({
         ...s,
         key: s.service_id,
+        cashier: cashierName(names, s.user_id),
         can_undo: role === "owner" || (s.user_id === userId && new Date(s.service_ts).toDateString() === today),
       }))
     );
@@ -204,7 +210,7 @@ export default function ServicesScreen({ userId, role }) {
           renderId={(r) => `#${r.service_id}`}
           columns={[
             { label: "Time", render: (r) => formatManilaDateTime(r.service_ts) },
-            { label: "Cashier", render: (r) => r.profiles?.full_name ?? "Former staff" },
+            { label: "Cashier", render: (r) => r.cashier },
             { label: "Type", render: (r) => r.service_type },
             { label: "Total", align: "right", render: (r) => Number(r.total_amount).toFixed(2) },
           ]}

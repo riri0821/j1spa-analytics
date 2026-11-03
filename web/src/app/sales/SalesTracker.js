@@ -6,6 +6,7 @@ import { pagedQuery } from "@/lib/analytics";
 import { theme } from "../dashboard/theme";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
 import { formatManilaDateTime } from "@/lib/ledger";
+import { fetchProfileNames, cashierName } from "@/lib/profileNames";
 import DateWindowPicker, { useDateWindow } from "@/components/DateWindowPicker";
 
 // .in() goes into the request URL, so a year of sales would build a query
@@ -57,7 +58,7 @@ export default function SalesTracker({ role }) {
           supabase
             .from("sales")
             .select(
-              "sale_id, sale_ts, total_amount, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
+              "sale_id, sale_ts, total_amount, user_id, customer_name, customer_contact, customer_address, customer_vehicle_brand"
             )
             .eq("status", "confirmed")
             .gte("sale_ts", startInstant)
@@ -71,7 +72,7 @@ export default function SalesTracker({ role }) {
           supabase
             .from("services")
             .select(
-              "service_id, service_ts, service_type, total_amount, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
+              "service_id, service_ts, service_type, total_amount, user_id, customer_name, customer_contact, customer_address, customer_vehicle_brand"
             )
             .eq("status", "confirmed")
             .gte("service_ts", startInstant)
@@ -104,12 +105,17 @@ export default function SalesTracker({ role }) {
         lineCounts = counts;
       }
 
+      // From profile_names(), not an embedded profiles(full_name) - see
+      // src/lib/profileNames.js for why the embed came back empty for staff.
+      const { names } = await fetchProfileNames(supabase);
+
       const saleRows = sales.map((s) => ({
         ...s,
         key: `sale-${s.sale_id}`,
         kind: "Sale",
         ts: s.sale_ts,
         detail: `${lineCounts[s.sale_id] ?? 0} line(s)`,
+        cashier: cashierName(names, s.user_id),
       }));
       const serviceRows = services.map((s) => ({
         ...s,
@@ -117,6 +123,7 @@ export default function SalesTracker({ role }) {
         kind: "Service",
         ts: s.service_ts,
         detail: s.service_type,
+        cashier: cashierName(names, s.user_id),
       }));
 
       setRecords([...saleRows, ...serviceRows].sort((a, b) => new Date(b.ts) - new Date(a.ts)));
@@ -203,7 +210,7 @@ export default function SalesTracker({ role }) {
           columns={[
             { label: "Time", render: (r) => formatManilaDateTime(r.ts) },
             { label: "Type", render: (r) => r.kind },
-            { label: "Cashier", render: (r) => r.profiles?.full_name ?? "Former staff" },
+            { label: "Cashier", render: (r) => r.cashier },
             { label: "Detail", render: (r) => r.detail },
             ...(isOwner
               ? [{ label: "Total", align: "right", render: (r) => Number(r.total_amount).toFixed(2) }]

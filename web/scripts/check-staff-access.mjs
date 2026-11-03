@@ -29,6 +29,12 @@
  * owner_* functions as missing and both undo RPCs as FAIL, which is accurate
  * - that is the bypass 033 closes.
  *
+ * Two groups belong to migration 035 and likewise hold in both modes: that
+ * data_origin is not readable by staff (and that taking it away left the
+ * rest of those tables readable), and that profile_names() hands staff a
+ * colleague's display name and nothing else about the account. Both report
+ * SKIP until 035 is applied.
+ *
  * Writes nothing except the temporary user. Exits 1 if any check fails.
  */
 import { createAnonClient, createServiceClient } from "./lib/db.mjs";
@@ -293,6 +299,118 @@ try {
     }
   }
 
+  // -------------------------------------------------- the provenance tag
+  //
+  // data_origin says a row came from the seed or the simulation. It is not
+  // cost, but it is the same kind of thing: something the screens were never
+  // meant to say. It used to sit in `note`, where staff read it on the Sales
+  // screen and in both CSV exports. Migration 035 moved it and took the
+  // grant away, so this is denied in BOTH modes - it has nothing to do with
+  // 034. Reported as SKIP until 035 is applied, when the column is absent.
+  for (const [tbl, col] of [
+    ["sales", "sale_id"],
+    ["services", "service_id"],
+    ["stock_movements", "movement_id"],
+  ]) {
+    const { error } = await staff.from(tbl).select(`${col}, data_origin`).limit(1);
+    const message = error?.message ?? "";
+    const absent = /data_origin/.test(message) && /does not exist|could not find/i.test(message);
+    const { data: exists } = await admin.from(tbl).select("data_origin").limit(1);
+    if (absent && exists == null) {
+      record("Provenance tag", `${tbl}.data_origin`, "SKIP", "the column does not exist yet (035 is not applied)");
+      continue;
+    }
+    record(
+      "Provenance tag",
+      `${tbl}.data_origin`,
+      error ? "PASS" : "FAIL",
+      error ? `"${message.slice(0, 70)}"` : "readable by staff, which is what 035 was for"
+    );
+  }
+
+  // ...and the rest of each table is still readable, which is the half a
+  // grant conversion could silently break: 035 replaces the table-wide
+  // grants with per-column lists to leave one column out, so this says the
+  // lists are complete.
+  await probe("Provenance tag", "sales without it, as the screens ask", "allowed", () =>
+    staff
+      .from("sales")
+      .select("sale_id, sale_ts, total_amount, note, user_id, customer_name, customer_vehicle_brand")
+      .limit(1)
+  );
+  await probe("Provenance tag", "services without it, as the screens ask", "allowed", () =>
+    staff
+      .from("services")
+      .select("service_id, service_ts, service_type, total_amount, user_id, customer_name")
+      .limit(1)
+  );
+
+  // ------------------------------------------------------- colleagues' names
+  //
+  // The Cashier column needs a name for a sale somebody else recorded. The
+  // profiles policy hides other people's rows from staff, so the embedded
+  // profiles(full_name) came back empty and every such sale read "Former
+  // staff". profile_names() (035) returns only (id, full_name).
+  //
+  // Two things to settle, and the second matters as much as the first: that
+  // staff can call it at all, and that it hands back nothing else - no
+  // username (they are email addresses), no role, no is_active.
+  {
+    const { data, error } = await staff.rpc("profile_names");
+    if (error && /could not find the function|does not exist/i.test(error.message)) {
+      record("Colleagues' names", "profile_names()", "SKIP", "the function does not exist yet (035 is not applied)");
+    } else if (error) {
+      record("Colleagues' names", "profile_names() is callable by staff", "FAIL", `"${error.message.slice(0, 70)}"`);
+    } else {
+      const rows = data ?? [];
+      record(
+        "Colleagues' names",
+        "profile_names() is callable by staff",
+        rows.length > 0 ? "PASS" : "FAIL",
+        `${fmtInt(rows.length)} name${rows.length === 1 ? "" : "s"}`
+      );
+
+      // Every key on every row, not just the first: one row carrying an
+      // extra field is the whole leak.
+      const keys = [...new Set(rows.flatMap((r) => Object.keys(r)))].sort();
+      const extra = keys.filter((k) => k !== "id" && k !== "full_name");
+      record(
+        "Colleagues' names",
+        "it returns id and full_name, and nothing else",
+        extra.length === 0 && keys.length === 2 ? "PASS" : "FAIL",
+        extra.length ? `also returned: ${extra.join(", ")}` : `keys: ${keys.join(", ") || "(none)"}`
+      );
+
+      // Named explicitly, because these are the columns that would matter.
+      const leaked = keys.filter((k) => /username|email|role|is_active|password/i.test(k));
+      record(
+        "Colleagues' names",
+        "no username, email, role or is_active",
+        leaked.length === 0 ? "PASS" : "FAIL",
+        leaked.length ? `leaked: ${leaked.join(", ")}` : "none of them are in the result"
+      );
+
+      // The point of the whole thing: a colleague's name, not just their own.
+      const others = rows.filter((r) => r.id !== userId);
+      record(
+        "Colleagues' names",
+        "it includes somebody other than the caller",
+        others.length > 0 ? "PASS" : "FAIL",
+        `${fmtInt(others.length)} other account${others.length === 1 ? "" : "s"}`
+      );
+
+      // And the direct read it replaces is still shut, which is what makes
+      // the function worth having rather than a widened policy.
+      const { data: direct } = await staff.from("profiles").select("id, full_name").neq("id", userId);
+      record(
+        "Colleagues' names",
+        "profiles itself still hides other rows",
+        (direct ?? []).length === 0 ? "PASS" : "FAIL",
+        `${fmtInt((direct ?? []).length)} row${(direct ?? []).length === 1 ? "" : "s"} read directly`
+      );
+    }
+  }
+
   // ------------------------------------------------- staff can still work
   await probe("Staff can still work", "products, the columns Sales Entry needs", "allowed", () =>
     staff.from("products").select("product_id, sku, name, category, brand, unit_price, stock_on_hand").eq("is_active", true).limit(5)
@@ -301,7 +419,7 @@ try {
     staff.from("products").select("category").limit(5)
   );
   await probe("Staff can still work", "sales, the columns the tracker shows", "allowed", () =>
-    staff.from("sales").select("sale_id, sale_ts, total_amount, customer_name, profiles(full_name)").limit(5)
+    staff.from("sales").select("sale_id, sale_ts, total_amount, user_id, customer_name").limit(5)
   );
   await probe("Staff can still work", "sale_items, non-cost", "allowed", () =>
     staff.from("sale_items").select("sale_id, sku, quantity, unit_price, line_revenue, products(name)").limit(5)
@@ -336,16 +454,20 @@ try {
   const groups = [...new Set(results.map((r) => r.group))];
   for (const group of groups) {
     section(group);
+    const beforeOrAfter = AFTER ? "must be DENIED" : "expected to succeed, documenting the hole";
     const want =
-      group === "Cost columns" || group === "Profit views and RPCs"
-        ? AFTER ? "must be DENIED" : "expected to succeed, documenting the hole"
-        : group === "Owner-only tables"
-          ? AFTER ? "must be DENIED" : "expected to succeed, documenting the hole"
-          : group === "Owner-only functions"
-            ? "must be DENIED in both modes - the check is inside the function"
-            : group === "No-profile caller"
-              ? "current_user_role() is NULL here: every owner_* function, and both undo RPCs, must DENY"
-              : "must be ALLOWED in both modes";
+      {
+        "Cost columns": beforeOrAfter,
+        "Profit views and RPCs": beforeOrAfter,
+        "Owner-only tables": beforeOrAfter,
+        "Owner-only functions": "must be DENIED in both modes - the check is inside the function",
+        "No-profile caller":
+          "current_user_role() is NULL here: every owner_* function, and both undo RPCs, must DENY",
+        "Provenance tag":
+          "data_origin must be DENIED in both modes (035, not 034); everything beside it must still read",
+        "Colleagues' names":
+          "the names must be ALLOWED, and nothing else about an account may come with them",
+      }[group] ?? "must be ALLOWED in both modes";
     console.log(`  ${want}\n`);
     for (const r of results.filter((x) => x.group === group)) {
       console.log(`  ${r.outcome.padEnd(4)}  ${r.label.padEnd(58)} ${r.detail}`);

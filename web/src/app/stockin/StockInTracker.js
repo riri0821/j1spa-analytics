@@ -52,7 +52,11 @@ export default function StockInTracker() {
           ...r,
           key: `movement-${r.movement_id}`,
           name: r.product_name ?? r.sku,
-          profiles: { full_name: r.recorded_by },
+          // owner_stockin_log() is security definer and joins profiles
+          // itself, so this name was never hidden by the profiles policy -
+          // the function is owner-only anyway. A null recorded_by here does
+          // mean the account is gone.
+          cashier: r.recorded_by || "Former staff",
         }))
       );
     },
@@ -156,7 +160,7 @@ export default function StockInTracker() {
             { label: "Supplier", render: (r) => r.supplier ?? "-" },
             { label: "Qty added", align: "right", render: (r) => `+${r.quantity}` },
             { label: "Spent", align: "right", render: (r) => (r.spent != null ? money(r.spent) : "-") },
-            { label: "Recorded by", render: (r) => r.profiles?.full_name ?? "Former staff" },
+            { label: "Recorded by", render: (r) => r.cashier },
           ]}
           fetchDetail={fetchDetail}
           emptyMessage="No stock received in this window."

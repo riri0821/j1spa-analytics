@@ -7,6 +7,7 @@ import SalesTracker from "./SalesTracker";
 import ServicesScreen from "./ServicesScreen";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
 import { formatManilaDateTime } from "@/lib/ledger";
+import { fetchProfileNames, cashierName } from "@/lib/profileNames";
 import CategoryProductPicker from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
@@ -39,7 +40,7 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
     const { data: sales } = await supabase
       .from("sales")
       .select(
-        "sale_id, sale_ts, total_amount, note, user_id, customer_name, customer_contact, customer_address, customer_vehicle_brand, profiles(full_name)"
+        "sale_id, sale_ts, total_amount, note, user_id, customer_name, customer_contact, customer_address, customer_vehicle_brand"
       )
       .eq("status", "confirmed")
       // By time, not by id. The October gap fill inserted rows with the
@@ -56,10 +57,17 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
       return;
     }
 
-    const { data: items } = await supabase
-      .from("sale_items")
-      .select("sale_id")
-      .in("sale_id", list.map((s) => s.sale_id));
+    // The names come from profile_names(), not from an embedded
+    // profiles(full_name): the policy on profiles hides other people's rows
+    // from a staff user, so the embed was empty for every sale somebody else
+    // recorded. See src/lib/profileNames.js.
+    const [{ data: items }, { names }] = await Promise.all([
+      supabase
+        .from("sale_items")
+        .select("sale_id")
+        .in("sale_id", list.map((s) => s.sale_id)),
+      fetchProfileNames(supabase),
+    ]);
 
     const lineCounts = {};
     (items ?? []).forEach((it) => {
@@ -71,6 +79,7 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
       list.map((s) => ({
         ...s,
         lines: lineCounts[s.sale_id] ?? 0,
+        cashier: cashierName(names, s.user_id),
         can_undo: role === "owner" || (s.user_id === userId && new Date(s.sale_ts).toDateString() === today),
       }))
     );
@@ -648,7 +657,7 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
           renderId={(r) => `#${r.sale_id}`}
           columns={[
             { label: "Time", render: (r) => formatManilaDateTime(r.sale_ts) },
-            { label: "Cashier", render: (r) => r.profiles?.full_name ?? "Former staff" },
+            { label: "Cashier", render: (r) => r.cashier },
             { label: "Lines", align: "right", render: (r) => r.lines },
             { label: "Total", align: "right", render: (r) => Number(r.total_amount).toFixed(2) },
             { label: "Note", render: (r) => r.note },
