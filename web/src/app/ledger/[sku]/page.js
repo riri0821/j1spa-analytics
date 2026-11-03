@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { buildLedger, formatManilaDate, manilaDayStart, paginateLedger, parseDateParam } from "@/lib/ledger";
+import { escapeLikeTerm } from "@/lib/searchFilter";
 import { theme, CATEGORICAL, DELTA_DOWN, DELTA_UP } from "../../dashboard/theme";
 import Sidebar from "../../dashboard/Sidebar";
 import Card from "../../dashboard/Card";
@@ -66,13 +67,14 @@ export default async function LedgerPage({ params, searchParams }) {
   const to = parseDateParam(query.to);
 
   // SKUs are stored upper-case, but a hand-typed or older link can arrive in
-  // any case. The escape keeps a SKU containing % or _ from being read as a
-  // LIKE wildcard and matching a different product.
+  // any case. escapeLikeTerm keeps a SKU containing % or _ from being read
+  // as a LIKE wildcard and matching a different product - this is where that
+  // helper came from, and it is now shared with the search boxes.
   const requestedSku = decodeURIComponent(skuParam);
   const { data: product } = await supabase
     .from("products")
     .select("product_id, sku, name, category, brand, supplier, unit_price, reorder_point, stock_on_hand, created_at")
-    .ilike("sku", requestedSku.replace(/[\\%_]/g, (c) => `\\${c}`))
+    .ilike("sku", escapeLikeTerm(requestedSku))
     .maybeSingle();
 
   if (!product) {

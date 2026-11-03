@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { theme } from "@/app/dashboard/theme";
+import { orIlikeFilter } from "@/lib/searchFilter";
 
 // Shared "pick a category, then the item" product picker, used by Sales
 // Entry, the Edit Sale panel, Stock In and (as the select-pair variant
@@ -82,13 +83,14 @@ export async function fetchCategoryCounts(supabase, { activeOnly = true } = {}) 
 /** Active products, optionally narrowed to one category and/or a search
  *  term. `columns` is the caller's own select list. */
 export async function fetchActiveProducts(supabase, { columns, category, term, searchFields }) {
-  // Commas and parentheses are the .or() filter's own syntax, so they are
-  // stripped rather than escaped - same approach the screens used before.
-  const safeTerm = (term ?? "").replace(/[,()]/g, "").trim();
+  // Escaped and quoted rather than stripped - see lib/searchFilter.js. The
+  // old version deleted , ( ) from the term, which made a supplier called
+  // "Acme, Inc." unsearchable and left the LIKE wildcards alone.
+  const searchFilter = orIlikeFilter(searchFields, term);
   return fetchAllPages(() => {
     let q = supabase.from("products").select(columns).eq("is_active", true).order("name");
     if (category) q = q.eq("category", category);
-    if (safeTerm) q = q.or(searchFields.map((f) => `${f}.ilike.%${safeTerm}%`).join(","));
+    if (searchFilter) q = q.or(searchFilter);
     return q;
   });
 }

@@ -6,6 +6,7 @@ import { theme, CATEGORICAL } from "../dashboard/theme";
 import PaginationControls from "@/components/PaginationControls";
 import RowSizeSelect from "@/components/RowSizeSelect";
 import { usePageSize } from "@/lib/pageSize";
+import { orIlikeFilter } from "@/lib/searchFilter";
 import { CategorySelect, fetchCategoryCounts } from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-2 py-1.5 text-sm w-full";
@@ -43,7 +44,7 @@ export default function ProductsScreen() {
     async (term, category) => {
       setLoading(true);
       setError("");
-      const safeTerm = (term ?? "").replace(/[,()]/g, "");
+      const searchFilter = orIlikeFilter(["name", "sku", "supplier", "category"], term);
       let query = supabase
         .from("products")
         .select(
@@ -54,11 +55,7 @@ export default function ProductsScreen() {
 
       if (category) query = query.eq("category", category);
 
-      if (safeTerm) {
-        query = query.or(
-          `name.ilike.%${safeTerm}%,sku.ilike.%${safeTerm}%,supplier.ilike.%${safeTerm}%,category.ilike.%${safeTerm}%`
-        );
-      }
+      if (searchFilter) query = query.or(searchFilter);
 
       const { data, error: fetchError } = await query;
       if (fetchError) setError(fetchError.message);
