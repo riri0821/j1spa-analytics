@@ -5,6 +5,8 @@ import Sidebar from "../dashboard/Sidebar";
 import SalesScreen from "./SalesScreen";
 import ExportButton from "./ExportButton";
 
+export const metadata = { title: "Sales" };
+
 export default async function SalesPage({ searchParams }) {
   const supabase = await createClient();
   const {

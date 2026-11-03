@@ -10,6 +10,8 @@ import BestSellingChart from "./BestSellingChart";
 import StockByCategoryChart from "./StockByCategoryChart";
 import TrackingTable from "./TrackingTable";
 
+export const metadata = { title: "Dashboard" };
+
 export default async function DashboardPage() {
   const supabase = await createClient();
   const {

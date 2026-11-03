@@ -30,6 +30,16 @@ async function fetchAllMovements(supabase, productId) {
   }
 }
 
+// The SKU comes from the URL rather than from a lookup: generateMetadata
+// runs as its own pass, and a second products query just to title the tab
+// would double the page's cost for a product the page below is about to read
+// anyway. A SKU that matches nothing still titles the "not found" card
+// correctly.
+export async function generateMetadata({ params }) {
+  const { sku } = await params;
+  return { title: `Ledger ${decodeURIComponent(sku)}` };
+}
+
 function peso(n) {
   return `₱${Number(n ?? 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }

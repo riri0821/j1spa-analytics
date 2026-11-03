@@ -19,6 +19,8 @@ function manilaDateTime(ts) {
   });
 }
 
+export const metadata = { title: "Decision Support" };
+
 export default async function DecisionSupportPage() {
   const supabase = await createClient();
   const {

@@ -4,6 +4,8 @@ import { theme } from "../dashboard/theme";
 import Sidebar from "../dashboard/Sidebar";
 import SettingsScreen from "./SettingsScreen";
 
+export const metadata = { title: "Settings" };
+
 export default async function SettingsPage() {
   const supabase = await createClient();
   const {

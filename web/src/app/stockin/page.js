@@ -4,6 +4,8 @@ import { theme } from "../dashboard/theme";
 import Sidebar from "../dashboard/Sidebar";
 import StockInScreen from "./StockInScreen";
 
+export const metadata = { title: "Stock In" };
+
 export default async function StockInPage() {
   const supabase = await createClient();
   const {

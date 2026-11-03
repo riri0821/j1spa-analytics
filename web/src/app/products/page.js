@@ -4,6 +4,8 @@ import { theme } from "../dashboard/theme";
 import Sidebar from "../dashboard/Sidebar";
 import ProductsScreen from "./ProductsScreen";
 
+export const metadata = { title: "Products" };
+
 export default async function ProductsPage() {
   const supabase = await createClient();
   const {

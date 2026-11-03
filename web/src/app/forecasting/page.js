@@ -6,6 +6,8 @@ import ForecastWorkspace from "./ForecastWorkspace";
 
 const PAGE_SIZE = 1000; // PostgREST's per-request ceiling
 
+export const metadata = { title: "Forecasting" };
+
 export default async function ForecastingPage({ searchParams }) {
   const supabase = await createClient();
   const {
