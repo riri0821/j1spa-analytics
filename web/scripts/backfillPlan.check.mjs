@@ -17,6 +17,7 @@ import {
 import { makeRand, manilaParts, randInt, STORE_CLOSE_HOUR, STORE_OPEN_HOUR } from "./lib/seedlib.mjs";
 import { planDelivery } from "./simulate-recent-activity.mjs";
 import {
+  countRewrittenRows,
   planProductWindow,
   planWindowDeliveries,
   rechainAfterWindow,
@@ -657,6 +658,63 @@ const HISTORY = [
   is("a drift of +3 would move every later balance",
     drifted.map((r) => [r.movement_id, r.previousBalanceAfter, r.balance_after]),
     [[4, 35, 38], [5, 45, 48]]);
+}
+
+// ------------------------- gap mode: the --apply zero-rewrite precondition
+//
+// --apply writes inserts only, so it refuses unless no existing row would get
+// a new balance_after. That is the whole safety story for a path with no
+// backup, so the counter behind it is worth pinning down.
+
+{
+  const existing = [mv(3, W_START + 2 * 86400_000, -2, 40)];
+
+  // New rows entirely AFTER the existing one: its balance is untouched, which
+  // is the October window's situation.
+  const after = planProductWindow({
+    opening: 42,
+    existingInside: existing,
+    newRows: [
+      { movement_ts: W_START + 3 * 86400_000, quantity: 7 },
+      { movement_ts: W_START + 4 * 86400_000, quantity: -7 },
+    ],
+  });
+  is("nothing to rewrite when the added rows all follow the existing one",
+    countRewrittenRows(after.rows), 0);
+  ok("and the plan is appliable", after.ok, after.problems.join("; "));
+
+  // A delivery BEFORE it, and the sales after: the existing row's balance
+  // moves, so --apply must refuse.
+  const straddling = planProductWindow({
+    opening: 42,
+    existingInside: existing,
+    newRows: [
+      { movement_ts: W_START + 86400_000, quantity: 7 },
+      { movement_ts: W_START + 4 * 86400_000, quantity: -7 },
+    ],
+  });
+  is("one rewrite when an added row lands before the existing one",
+    countRewrittenRows(straddling.rows), 1);
+  is("and it is the right row, with both balances",
+    straddling.rows
+      .filter((r) => r.movement_id != null)
+      .map((r) => [r.movement_id, r.previousBalanceAfter, r.balance_after]),
+    [[3, 40, 47]]);
+  // Still a VALID plan - the added rows net to zero and nothing goes
+  // negative. It is refused for a different reason: it would edit a recorded
+  // row without a backup.
+  ok("the straddling plan is otherwise valid", straddling.ok, straddling.problems.join("; "));
+
+  // Rows with no movement_id are never counted, however their balances land.
+  is("new rows are never counted as rewrites",
+    countRewrittenRows([
+      { movement_ts: W_START, quantity: 1, balance_after: 5, previousBalanceAfter: null },
+      { movement_ts: W_START, quantity: 1, balance_after: 6, previousBalanceAfter: null },
+    ]),
+    0);
+  is("an untouched existing row is not counted",
+    countRewrittenRows([{ movement_id: 9, balance_after: 12, previousBalanceAfter: 12 }]), 0);
+  is("an empty window has nothing to rewrite", countRewrittenRows([]), 0);
 }
 
 // ------------------------------------------------------------------- done

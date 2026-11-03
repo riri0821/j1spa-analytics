@@ -282,6 +282,7 @@ both tag their rows so they can be told apart from anything genuine.
 | --- | --- | --- |
 | Seed sales + the ledger backfill | 1 Jan 2020, 08:35 → 30 Sep 2026, 17:50 | `stock_movements.note = 'seed-backfill'` |
 | `simulate-recent-activity.mjs` | 8 Oct 2026 → the last run | `note = 'simulated'` on sales and movements; service id ranges in `web/scripts/simulated-ids.json` |
+| The same script in gap mode (`--from`/`--to`) | 1 to 6 Oct 2026 | the same tags. Added to fill the window between the seed's end and the simulated month, which read as a demand dip |
 | Hand-entered test sales | 30 Sep (evening), 3-6 Oct 2026 | none. Ten sales entered through the app, all outside 08:00-18:00 trading hours. One carries `note = 'a'` |
 
 `web/scripts/simulated-ids.json` records every simulation run: the window it covered

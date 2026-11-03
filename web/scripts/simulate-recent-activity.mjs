@@ -48,6 +48,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import {
+  countRewrittenRows,
   planProductWindow,
   planWindowDeliveries,
   rechainAfterWindow,
@@ -339,14 +340,25 @@ async function main() {
 
     if (!args.apply) {
       section("Dry run complete - nothing was written");
-      console.log("  Gap-mode --apply is not implemented in this branch - see the backup");
-      console.log("  section above for why, and for the SQL to run first.");
+      console.log("  Re-run with the same --from/--to plus --apply to write these rows.");
+      console.log("  --apply re-proves the zero-rewrite precondition against a freshly");
+      console.log("  loaded ledger first, and refuses if it no longer holds.");
       return;
     }
-    section("--apply REFUSED for gap mode");
-    console.log("  Not implemented in this branch - see the backup section above. The dry");
-    console.log("  run is the deliverable; nothing was written.");
-    process.exitCode = 1;
+    const result = await applyGapPlan(sb, gapPlan, gap, pageSize);
+    if (!result.ok) {
+      section("Nothing was written");
+      process.exitCode = 1;
+      return;
+    }
+    section("Applied");
+    console.log(`  sales            : ${fmtInt(result.insertedSales.length)}`);
+    console.log(`  sale_items       : ${fmtInt(result.itemsDone)}`);
+    console.log(`  sale movements   : ${fmtInt(result.saleMovesDone)}`);
+    console.log(`  stock_in         : ${fmtInt(result.restockDone)}`);
+    console.log(`  services         : ${fmtInt(result.insertedServices.length)}`);
+    console.log("");
+    console.log("  Verify with: node scripts/verify-gapfill.mjs");
     return;
   }
 
@@ -1351,11 +1363,12 @@ export function planGapFill({ products, patterns, movementsByProduct, windowStar
     });
 
     for (const d of deliveries) {
-      restocks.push({
+      const row = {
         product_id: productId,
         sku: product.sku,
         movement_type: "stock_in",
         quantity: d.qty,
+        balance_after: null, // filled in by the rechain below
         user_id: null,
         reference: deliveryReceipt(d.ts),
         note: SIMULATED_NOTE,
@@ -1363,7 +1376,13 @@ export function planGapFill({ products, patterns, movementsByProduct, windowStar
         supplier: product.supplier ?? null,
         unit_cost: product.unit_cost ?? null,
         __ts: d.ts,
-      });
+      };
+      // The row carries a reference to itself, so the rechain writes the
+      // balance back by identity. Matching on (ts, quantity) instead left
+      // same-instant rows indistinguishable, and one of them kept a null
+      // balance_after all the way to the NOT NULL column.
+      row.__target = row;
+      restocks.push(row);
     }
   }
 
@@ -1384,7 +1403,7 @@ export function planGapFill({ products, patterns, movementsByProduct, windowStar
         supplier: null,
         unit_cost: null,
         __ts: s.__ts,
-        __saleRef: s,
+        // The line the balance belongs on; applyGapPlan reads it from there.
         __line: l,
       });
     }
@@ -1411,15 +1430,13 @@ export function planGapFill({ products, patterns, movementsByProduct, windowStar
     if (!plan.ok) problems.push(`${byId.get(productId).sku}: ${plan.problems.join("; ")}`);
     minBalanceSeen = Math.min(minBalanceSeen, plan.minBalance);
 
-    // Carry the recomputed balances back onto the rows that will be written.
+    // Carry the recomputed balances back onto the rows that will be written,
+    // by identity rather than by value.
     for (const r of plan.rows) {
       if (r.movement_id == null) {
-        const target = r.__saleRef ? r.__line : null;
-        if (target) target.__balanceAfter = r.balance_after;
-        else {
-          const match = restocks.find((x) => x.product_id === productId && x.__ts === r.movement_ts && x.quantity === r.quantity);
-          if (match) match.balance_after = r.balance_after;
-        }
+        if (r.__line) r.__line.__balanceAfter = r.balance_after;
+        else if (r.__target) r.__target.balance_after = r.balance_after;
+        else throw new Error(`a new row for ${byId.get(productId).sku} has nowhere to put its balance`);
       } else if (r.balance_after !== r.previousBalanceAfter) {
         updates.push({
           movement_id: r.movement_id,
@@ -1657,7 +1674,7 @@ function printGapPlan({ plan, gap, allSales, allMovements, products, existingSer
   }
 
   // ------------------------------------------------------------- backup
-  section("Backup, and why --apply is not wired up");
+  section("Backup, and what --apply will and will not touch");
   console.log("  The backup cannot be taken by this script. `create table ... as select` is");
   console.log("  DDL, and PostgREST does not execute DDL; the `backup` schema is also not");
   console.log("  exposed to the API, so the service-role key cannot even insert into it.");
@@ -1681,10 +1698,236 @@ function printGapPlan({ plan, gap, allSales, allMovements, products, existingSer
   console.log("  the inserted sales/sale_items/stock_movements by note = 'simulated' inside");
   console.log("  the window, and the services by the id range recorded in simulated-ids.json.");
   console.log("");
-  console.log("  --apply is deliberately not implemented for gap mode in this branch. The");
-  console.log("  plan above is what it would write; review it, take the backup, then ask for");
-  console.log("  the apply path. Writing an untested path that edits the middle of 277,666");
-  console.log("  ledger rows is not something to leave sitting behind a flag.");
+  console.log("  --apply writes only inserts, never updates. It re-proves the zero-rewrite");
+  console.log("  precondition against a freshly loaded ledger immediately before writing and");
+  console.log("  refuses if it no longer holds, because at that point a backup is required");
+  console.log("  and this path cannot take one.");
+}
+
+/**
+ * Gap-mode --apply.
+ *
+ * The precondition is the whole safety story. The dry run proved that this
+ * window's plan rewrites NO existing stock_movements row, so there is nothing
+ * to back up and nothing recorded can be lost. That is re-proved here against
+ * a freshly loaded ledger, immediately before writing: if even one existing
+ * row would need a new balance_after, this refuses, because at that point a
+ * backup is required and this path does not take one (PostgREST executes no
+ * DDL, and the `backup` schema is not exposed to the API).
+ *
+ * Writes are grouped per SALE, not per product. A sale spans up to six
+ * products, so a per-product grouping would have to tear each sale's items
+ * apart and could leave a sales row with some of its lines missing, which is
+ * worse than what it protects against. Per sale, a failure leaves at most one
+ * sale incomplete; the restocks, which are genuinely per product, are grouped
+ * that way. Recovery is the backfill's rule either way: everything written
+ * here is tagged 'simulated' and sits inside the window, so deleting exactly
+ * that and re-running finishes the job.
+ */
+async function applyGapPlan(sb, plan, gap, pageSize) {
+  section("Applying the gap fill");
+
+  // ------------------------------------------------- re-prove the precondition
+  progressLine("re-loading every movement to re-check the precondition...");
+  const freshMovements = await pageAll(
+    () =>
+      sb
+        .from("stock_movements")
+        .select("movement_id, product_id, sku, movement_ts, movement_type, quantity, balance_after, note")
+        .order("movement_id"),
+    { pageSize, label: "movements" }
+  );
+  progressDone(`movements now: ${fmtInt(freshMovements.length)}`);
+
+  const freshByProduct = new Map();
+  for (const m of freshMovements) {
+    if (!freshByProduct.has(m.product_id)) freshByProduct.set(m.product_id, []);
+    freshByProduct.get(m.product_id).push({ ...m, movement_ts: Date.parse(m.movement_ts) });
+  }
+
+  let wouldRewrite = 0;
+  for (const pp of plan.perProduct) {
+    const split = splitAroundWindow(freshByProduct.get(pp.productId) ?? [], plan.windowStart, plan.windowEnd);
+    const opening = split.openingBalance == null ? pp.opening : split.openingBalance;
+    const newRows = pp.rows.filter((r) => r.movement_id == null).map((r) => ({ ...r, balance_after: undefined }));
+    const check = planProductWindow({ opening, existingInside: split.inside, newRows });
+    if (!check.ok) {
+      console.log(`  REFUSING: ${pp.sku} - ${check.problems.join("; ")}`);
+      return { ok: false };
+    }
+    wouldRewrite += countRewrittenRows(check.rows);
+  }
+
+  console.log(`  existing rows that would need a new balance_after: ${fmtInt(wouldRewrite)}`);
+  if (wouldRewrite !== 0) {
+    console.log("");
+    console.log("  REFUSING to write. The dry run showed zero, so the data has moved since");
+    console.log("  then. Rewriting recorded rows needs the backup first, and this path does");
+    console.log("  not take one: PostgREST executes no DDL and the `backup` schema is not");
+    console.log("  exposed to the API. Take it in the SQL editor, then ask for an apply");
+    console.log("  path that updates as well as inserts.");
+    return { ok: false };
+  }
+  console.log("  precondition holds: nothing recorded will be touched.");
+
+  // ---------------------------------------------------------------- restocks
+  // Per product, which is what these actually are.
+  const restocksByProduct = new Map();
+  for (const m of plan.movements) {
+    if (!restocksByProduct.has(m.product_id)) restocksByProduct.set(m.product_id, []);
+    restocksByProduct.get(m.product_id).push(m);
+  }
+  const unfilled = [
+    ...plan.movements.filter((m) => m.balance_after == null),
+    ...plan.sales.flatMap((s) => s.lines.filter((l) => l.__balanceAfter == null)),
+  ];
+  if (unfilled.length > 0) {
+    console.log(`  REFUSING: ${fmtInt(unfilled.length)} planned rows have no balance_after.`);
+    console.log("  That is a bug in the planner, not a data problem. Nothing was written.");
+    return { ok: false };
+  }
+
+  let restockDone = 0;
+  for (const [, rows] of restocksByProduct) {
+    await insertBatched(
+      sb,
+      "stock_movements",
+      rows.map((m) => ({
+        product_id: m.product_id,
+        sku: m.sku,
+        movement_type: m.movement_type,
+        quantity: m.quantity,
+        balance_after: m.balance_after,
+        user_id: m.user_id,
+        reference: m.reference,
+        note: m.note,
+        movement_ts: m.movement_ts,
+        supplier: m.supplier,
+        unit_cost: m.unit_cost,
+      }))
+    );
+    restockDone += rows.length;
+    progressLine(`inserting restocks ${fmtInt(restockDone)}/${fmtInt(plan.movements.length)}`);
+  }
+  progressDone(`inserted ${fmtInt(restockDone)} stock_in movements`);
+
+  // ------------------------------------------------------------------- sales
+  // One chunk of sales at a time, each chunk's items and movements written
+  // before the next chunk starts, so a failure leaves at most the sales in
+  // one chunk without their lines.
+  const SALE_CHUNK = 50;
+  const insertedSales = [];
+  let itemsDone = 0;
+  let saleMovesDone = 0;
+
+  for (let i = 0; i < plan.sales.length; i += SALE_CHUNK) {
+    const chunk = plan.sales.slice(i, i + SALE_CHUNK);
+    const ids = await insertBatched(sb, "sales", chunk.map((s) => s.sale), { select: "sale_id" });
+    if (ids.length !== chunk.length) {
+      throw new Error(`expected ${chunk.length} sale ids back, got ${ids.length}`);
+    }
+    insertedSales.push(...ids);
+
+    const items = [];
+    const moves = [];
+    chunk.forEach((s, k) => {
+      const saleId = ids[k].sale_id;
+      for (const l of s.lines) {
+        items.push({
+          sale_id: saleId,
+          product_id: l.product_id,
+          sku: l.sku,
+          quantity: l.quantity,
+          unit_price: l.unit_price,
+          unit_cost: l.unit_cost,
+          line_revenue: l.line_revenue,
+          line_cost: l.line_cost,
+        });
+        moves.push({
+          product_id: l.product_id,
+          sku: l.sku,
+          movement_type: "sale_decrement",
+          quantity: -l.quantity,
+          balance_after: l.__balanceAfter,
+          user_id: s.sale.user_id,
+          reference: `sale:${saleId}`,
+          note: SIMULATED_NOTE,
+          movement_ts: s.sale.sale_ts,
+          supplier: null,
+          unit_cost: null,
+        });
+      }
+    });
+    await insertBatched(sb, "sale_items", items);
+    await insertBatched(sb, "stock_movements", moves);
+    itemsDone += items.length;
+    saleMovesDone += moves.length;
+    progressLine(`sales ${fmtInt(insertedSales.length)}/${fmtInt(plan.sales.length)}, lines ${fmtInt(itemsDone)}`);
+  }
+  progressDone(
+    `inserted ${fmtInt(insertedSales.length)} sales, ${fmtInt(itemsDone)} sale_items, ${fmtInt(saleMovesDone)} sale movements`
+  );
+
+  // ---------------------------------------------------------------- services
+  const insertedServices = plan.services.length
+    ? await insertBatched(
+        sb,
+        "services",
+        plan.services.map((s) => {
+          const row = { ...s };
+          delete row.__ts;
+          return row;
+        }),
+        { select: "service_id" }
+      )
+    : [];
+  progressDone(`inserted ${fmtInt(insertedServices.length)} services`);
+
+  // products.stock_on_hand is deliberately NOT written: the added rows net to
+  // zero per product, so the figure the ledger ends on is the one already
+  // stored. Writing it would be a no-op at best and a drift at worst.
+  console.log("  products.stock_on_hand: not written (the added rows net to zero)");
+
+  appendGapManifest({ insertedSales, insertedServices, plan, gap });
+
+  return { ok: true, insertedSales, insertedServices, itemsDone, saleMovesDone, restockDone };
+}
+
+function appendGapManifest({ insertedSales, insertedServices, plan, gap }) {
+  const saleIds = insertedSales.map((r) => r.sale_id);
+  const serviceIds = insertedServices.map((r) => r.service_id);
+
+  let file = { runs: [] };
+  try {
+    const parsed = JSON.parse(readFileSync(IDS_FILE, "utf8"));
+    if (Array.isArray(parsed.runs)) file = parsed;
+  } catch {
+    // no usable file yet - start a fresh one
+  }
+
+  file.runs.push({
+    generatedAt: new Date().toISOString(),
+    note: SIMULATED_NOTE,
+    mode: "gap",
+    window: { from: toManilaIso(plan.windowStart), to: toManilaIso(plan.windowEnd) },
+    sales: { first: saleIds[0] ?? null, last: saleIds.at(-1) ?? null, count: saleIds.length },
+    services: { first: serviceIds[0] ?? null, last: serviceIds.at(-1) ?? null, count: serviceIds.length },
+    stockMovements: { count: plan.movements.length + plan.saleMovements.length },
+  });
+  file.howToRemove = [
+    "Simulated sales and stock_movements carry note = 'simulated'.",
+    "Services have no note column, so use the service_id ranges in runs[].",
+    "delete from stock_movements where note = 'simulated';",
+    "delete from sale_items where sale_id in (select sale_id from sales where note = 'simulated');",
+    "delete from sales where note = 'simulated';",
+    "delete from services where service_id between <runs[].services.first> and <runs[].services.last>;",
+    "-- then recompute products.stock_on_hand, or restore it from the backup schema",
+    "-- a run with mode = 'gap' nets to zero per product, so stock_on_hand needs no",
+    "-- restoring for that one: deleting its rows leaves the figure where it was.",
+  ];
+
+  writeFileSync(IDS_FILE, `${JSON.stringify(file, null, 2)}\n`, "utf8");
+  console.log(`  appended run ${file.runs.length} to ${IDS_FILE}`);
 }
 
 // ---------------------------------------------------------------- apply

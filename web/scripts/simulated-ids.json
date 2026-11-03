@@ -17,6 +17,28 @@
         "last": 133,
         "count": 131
       }
+    },
+    {
+      "generatedAt": "2026-11-03T10:36:35.712Z",
+      "note": "simulated",
+      "mode": "gap",
+      "window": {
+        "from": "2026-10-01T00:00:00+08:00",
+        "to": "2026-10-07T00:00:00+08:00"
+      },
+      "sales": {
+        "first": 159293,
+        "last": 159950,
+        "count": 658
+      },
+      "services": {
+        "first": 134,
+        "last": 140,
+        "count": 7
+      },
+      "stockMovements": {
+        "count": 1719
+      }
     }
   ],
   "howToRemove": [
@@ -26,6 +48,8 @@
     "delete from sale_items where sale_id in (select sale_id from sales where note = 'simulated');",
     "delete from sales where note = 'simulated';",
     "delete from services where service_id between <runs[].services.first> and <runs[].services.last>;",
-    "-- then recompute products.stock_on_hand, or restore it from the backup schema"
+    "-- then recompute products.stock_on_hand, or restore it from the backup schema",
+    "-- a run with mode = 'gap' nets to zero per product, so stock_on_hand needs no",
+    "-- restoring for that one: deleting its rows leaves the figure where it was."
   ]
 }

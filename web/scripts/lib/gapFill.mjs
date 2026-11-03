@@ -115,7 +115,14 @@ export function planWindowDeliveries({ opening, demand, deliveryTs, openingTs, c
   const remainder = total - delivered;
   if (remainder > 0) deliveries.push({ ts: openingTs, qty: remainder });
 
-  return deliveries.sort((a, b) => a.ts - b.ts);
+  // Several shortfalls on one day each asked for their own delivery. Merge
+  // them: one receipt per instant reads the way a real delivery does, and it
+  // keeps two rows from being indistinguishable by (ts, qty).
+  const merged = new Map();
+  for (const d of deliveries) merged.set(d.ts, (merged.get(d.ts) ?? 0) + d.qty);
+  return [...merged.entries()]
+    .map(([ts, qty]) => ({ ts, qty }))
+    .sort((a, b) => a.ts - b.ts);
 }
 
 /**
@@ -207,4 +214,16 @@ export function rechainAfterWindow({ closing, openingOfAfter, after }) {
     previousBalanceAfter: m.balance_after,
     balance_after: m.balance_after + drift,
   }));
+}
+
+/**
+ * How many EXISTING rows a plan would give a new balance_after.
+ *
+ * This is gap-mode --apply's precondition: it writes inserts only, so it
+ * refuses unless this is zero. Rewriting a recorded row needs a backup
+ * first, and the apply path cannot take one (PostgREST executes no DDL, and
+ * the `backup` schema is not exposed to the API).
+ */
+export function countRewrittenRows(rows) {
+  return rows.filter((r) => r.movement_id != null && r.balance_after !== r.previousBalanceAfter).length;
 }
