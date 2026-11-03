@@ -1444,9 +1444,14 @@ begin
 
   return query
     select p.sku, p.name, p.category, p.stock_on_hand, p.reorder_point,
-           coalesce(v.units_90d, 0)        as units_90d,
-           coalesce(v.revenue_90d, 0)      as revenue_90d,
-           coalesce(v.gross_profit_90d, 0) as gross_profit_90d
+           -- ::numeric on all three. units_90d is the one that was wrong:
+           -- vw_product_velocity computes it as coalesce(sum(si.quantity), 0),
+           -- and sum(integer) is BIGINT, against a numeric declaration. The
+           -- other two are already numeric - cast anyway, so the three figures
+           -- that must agree in type say so in one place.
+           coalesce(v.units_90d, 0)::numeric        as units_90d,
+           coalesce(v.revenue_90d, 0)::numeric      as revenue_90d,
+           coalesce(v.gross_profit_90d, 0)::numeric as gross_profit_90d
     from products p
     left join vw_product_velocity v on v.sku = p.sku
     where p.is_active
@@ -1671,17 +1676,25 @@ begin
 
   return query
     select
+      -- Every column whose source type is not already identical to the
+      -- declaration is cast to it. recorded_by is the one that was wrong:
+      -- profiles.full_name is varchar(128) and the declaration says text,
+      -- which are different types, not a different length - so the whole
+      -- Stock-In Tracker came back empty. movement_id, movement_ts, quantity
+      -- and balance_after need no cast: bigint, timestamptz, integer and
+      -- integer match exactly.
       m.movement_id,
       m.movement_ts,
-      m.sku,
-      p.name as product_name,
+      m.sku::varchar(40),
+      p.name::varchar(160) as product_name,
       m.quantity,
       m.balance_after,
-      m.supplier,
-      m.unit_cost,
-      case when m.unit_cost is null then null else m.unit_cost * m.quantity end as spent,
-      m.reference,
-      pr.full_name as recorded_by
+      m.supplier::varchar(120),
+      m.unit_cost::numeric(12,2),
+      case when m.unit_cost is null then null
+           else m.unit_cost * m.quantity end::numeric as spent,
+      m.reference::varchar(120),
+      pr.full_name::text as recorded_by
     from stock_movements m
     left join products p  on p.product_id = m.product_id
     left join profiles pr on pr.id = m.user_id

@@ -36,7 +36,26 @@
  * colleague's display name and nothing else about the account. They report
  * SKIP until 035 is applied.
  *
- * Writes nothing except the temporary user. Exits 1 if any check fails.
+ * THE OWNER SIDE is checked too, and for a different kind of bug. Two
+ * owner_* functions shipped with a declared return type that did not match
+ * what their query returns - units_90d declared numeric arriving as bigint,
+ * recorded_by declared text arriving as varchar(128) - and a plpgsql
+ * `return query` only notices that when it returns a row. The owner
+ * dashboard and the Stock-In Tracker were empty in production while every
+ * staff check here passed, because nothing here had ever asked for an
+ * owner's rows. So the owner groups call all seven owner_* functions and the
+ * reads the owner screens do directly, and a group is only satisfied by ROWS
+ * COMING BACK. See sql/migrations/036_fix_owner_function_types.sql.
+ *
+ * That needs an owner, and there is exactly one real one. It is never
+ * touched: a second temporary user is created and promoted with the
+ * service-role client, the set of real owners is read before and after and
+ * compared, and the temporary owner is deleted in the same finally block as
+ * the rest - with its absence confirmed, not assumed.
+ *
+ * Writes nothing except the temporary users, and one `role` update on a
+ * profile row this script created seconds earlier. Exits 1 if any check
+ * fails.
  */
 import { createAnonClient, createServiceClient } from "./lib/db.mjs";
 import { fmtInt, section } from "./lib/seedlib.mjs";
@@ -49,6 +68,11 @@ if (expectArg !== "before" && expectArg !== "after") {
   process.exit();
 }
 const AFTER = expectArg === "after";
+
+// One real SKU, used for the ledger read and owner_stockin_by_supplier. It
+// has a long movement history, which is the point - a short one would not
+// show the per-row RLS cost migration 037 is about.
+const TIMED_SKU = "J1-0306";
 
 const results = [];
 function record(group, label, outcome, detail = "") {
@@ -122,6 +146,27 @@ function recordEditSaleRefusal(group, label, error) {
   );
 }
 
+/**
+ * probe(), with the wall-clock time of the call recorded alongside.
+ *
+ * The timings are the reason migration 037 exists: an RLS policy that calls
+ * current_user_role() or auth.uid() per row is re-evaluated per row, and a
+ * staff read of stock_movements was timing out on 279k of them. `(select
+ * current_user_role())` is evaluated once instead. These numbers are one
+ * sample from one machine over the public internet, not a benchmark - they
+ * are here to show the shape of the change, and to notice if it ever goes
+ * back.
+ */
+const timings = [];
+async function timedProbe(group, label, want, fn) {
+  const started = Date.now();
+  await probe(group, label, want, fn);
+  const ms = Date.now() - started;
+  timings.push({ label, ms });
+  const r = results[results.length - 1];
+  r.detail = `${r.detail}, ${fmtInt(ms)} ms`;
+}
+
 const admin = createServiceClient();
 const stamp = Date.now();
 const email = `staff-check-${stamp}@example.invalid`;
@@ -130,6 +175,40 @@ const password = `Sc-${stamp}-${Math.random().toString(36).slice(2, 10)}`;
 // of them however it exits.
 const createdUsers = [];
 let userId = null;
+
+/**
+ * The same, promoted to owner with the service-role client and signed in.
+ *
+ * `update profiles set role = 'owner'` is refused for `authenticated` by the
+ * policy from migration 030 - it is the escalation that migration closed -
+ * so this goes through the service key, which is what /settings does for its
+ * own writes. The id is the one createUser just handed back, never a lookup
+ * by role or name, so there is no path from here to the real owner's row.
+ */
+async function makeTempOwner(label) {
+  const user = await makeTempUser(label);
+  const { error: promoteError } = await admin
+    .from("profiles")
+    .update({ role: "owner" })
+    .eq("id", user.id);
+  if (promoteError) throw new Error(`could not promote the ${label} user: ${promoteError.message}`);
+
+  const { data: check, error: readError } = await admin
+    .from("profiles")
+    .select("role")
+    .eq("id", user.id)
+    .single();
+  if (readError) throw new Error(`could not re-read the ${label} profile: ${readError.message}`);
+  if (check.role !== "owner") throw new Error(`the ${label} user is '${check.role}', not owner`);
+
+  const client = createAnonClient();
+  const { error: signInError } = await client.auth.signInWithPassword({
+    email: user.email,
+    password: user.password,
+  });
+  if (signInError) throw new Error(`could not sign in as the ${label} owner: ${signInError.message}`);
+  return { ...user, client };
+}
 
 async function makeTempUser(label) {
   const addr = `staff-check-${stamp}-${label}@example.invalid`;
@@ -228,7 +307,33 @@ try {
       record("Owner-only tables", tbl, "SKIP", "the table is empty, so an empty result proves nothing");
       continue;
     }
-    await probe("Owner-only tables", `${tbl} (${fmtInt(count)} rows exist)`, ownerTableWant, () =>
+    const label = `${tbl} (${fmtInt(count)} rows exist)`;
+    // stock_movements is asked for by name rather than through probe(),
+    // which scores ANY error as a denial. On a table this size the staff
+    // read used to come back "canceling statement due to statement timeout"
+    // - which is not a denial, it is the policy scanning 279k rows and
+    // running out of time, and it would have scored PASS while proving
+    // nothing. Only a permission error or zero rows counts here.
+    if (tbl === "stock_movements" && AFTER) {
+      const { data, error } = await staff.from(tbl).select(columns).limit(1);
+      const message = error?.message ?? "";
+      const denied = /permission denied/i.test(message);
+      const emptied = !error && Array.isArray(data) && data.length === 0;
+      record(
+        "Owner-only tables",
+        label,
+        denied || emptied ? "PASS" : "FAIL",
+        denied
+          ? `"${message.slice(0, 60)}"`
+          : emptied
+            ? "no rows (an RLS policy, not a privilege)"
+            : error
+              ? `not a denial: "${message.slice(0, 60)}"`
+              : `${fmtInt(data?.length ?? 0)} row(s) came back`
+      );
+      continue;
+    }
+    await probe("Owner-only tables", label, ownerTableWant, () =>
       staff.from(tbl).select(columns).limit(1)
     );
   }
@@ -542,6 +647,196 @@ try {
     );
   }
 
+  // =====================================================================
+  //  THE OWNER SIDE
+  //
+  //  Everything above asks what staff cannot reach. None of it would notice
+  //  an owner screen that is simply broken - which is what happened: two
+  //  owner_* functions errored on their declared return types and the
+  //  dashboard and Stock-In Tracker came back empty, with every check here
+  //  green. Rows coming back is the bar.
+  // =====================================================================
+  {
+    // Read first, compared after: the real owner must be untouched by any of
+    // this. Sorted so the comparison does not depend on row order.
+    const { data: ownersBefore, error: ownersError } = await admin
+      .from("profiles")
+      .select("id, username")
+      .eq("role", "owner");
+    if (ownersError) throw new Error(`could not read the owner list: ${ownersError.message}`);
+    const before = (ownersBefore ?? []).map((o) => o.id).sort();
+    console.log("");
+    console.log(`  real owners before the owner checks: ${fmtInt(before.length)}`);
+
+    const owner = await makeTempOwner("owner");
+    console.log(`  temporary owner: ${owner.email}`);
+    console.log(`  id             : ${owner.id}  (promoted with the service key)`);
+
+    // ------------------------------------------- the seven owner functions
+    //
+    // Allowed AND non-empty. probe() scores an empty array as a denial, so
+    // "allowed" here already means rows came back - which is the half that
+    // was missing: both type bugs returned an error, but a function that
+    // silently returned nothing would have been just as broken on screen.
+    const october = { p_start: "2026-10-01", p_end: "2026-10-31", p_bucket: "day" };
+    await probe("Owner functions", "owner_product_catalog()", "allowed", () =>
+      owner.client.rpc("owner_product_catalog", { p_search: null, p_category: null, p_limit: 50 })
+    );
+    await probe("Owner functions", "owner_product_performance() (units_90d::numeric)", "allowed", () =>
+      owner.client.rpc("owner_product_performance")
+    );
+    await probe("Owner functions", "owner_sales_kpi_summary()", "allowed", () =>
+      owner.client.rpc("owner_sales_kpi_summary")
+    );
+    await probe("Owner functions", "owner_margin_trend()", "allowed", () =>
+      owner.client.rpc("owner_margin_trend")
+    );
+    await probe("Owner functions", "owner_gross_net_range()", "allowed", () =>
+      owner.client.rpc("owner_gross_net_range", october)
+    );
+    await probe("Owner functions", "owner_stockin_log() (recorded_by::text)", "allowed", () =>
+      owner.client.rpc("owner_stockin_log", {
+        p_start: "2026-10-01T00:00:00+08:00",
+        p_end: "2026-11-04T00:00:00+08:00",
+      })
+    );
+    await probe("Owner functions", "owner_stockin_by_supplier()", "allowed", () =>
+      owner.client.rpc("owner_stockin_by_supplier", { p_sku: TIMED_SKU })
+    );
+
+    // The two that were broken returned the wrong TYPE, not the wrong
+    // value, so the columns are checked by name as well: a renamed or
+    // dropped column is the next version of the same failure.
+    const { data: perf } = await owner.client.rpc("owner_product_performance");
+    const perfKeys = perf?.length ? Object.keys(perf[0]).sort() : [];
+    record(
+      "Owner functions",
+      "owner_product_performance() returns the columns the dashboard reads",
+      ["category", "gross_profit_90d", "name", "reorder_point", "revenue_90d", "sku", "stock_on_hand", "units_90d"]
+        .every((k) => perfKeys.includes(k))
+        ? "PASS"
+        : "FAIL",
+      perfKeys.length ? perfKeys.join(", ") : "no rows, so no columns to check"
+    );
+    const { data: log } = await owner.client.rpc("owner_stockin_log", {
+      p_start: "2026-10-01T00:00:00+08:00",
+      p_end: "2026-11-04T00:00:00+08:00",
+    });
+    const logKeys = log?.length ? Object.keys(log[0]).sort() : [];
+    record(
+      "Owner functions",
+      "owner_stockin_log() returns the columns the tracker reads",
+      ["balance_after", "movement_id", "movement_ts", "product_name", "quantity", "recorded_by", "reference", "sku", "spent", "supplier", "unit_cost"]
+        .every((k) => logKeys.includes(k))
+        ? "PASS"
+        : "FAIL",
+      logKeys.length ? logKeys.join(", ") : "no rows, so no columns to check"
+    );
+
+    // ----------------------------------- the reads the owner screens do
+    //
+    // Not every owner screen goes through a function. These three are the
+    // direct table reads, and they are where the per-row RLS cost is paid -
+    // so the two the user asked to be measured are timed.
+    const { data: product } = await admin
+      .from("products")
+      .select("product_id, sku")
+      .eq("sku", TIMED_SKU)
+      .maybeSingle();
+    if (!product) {
+      record("Owner screens", `ledger for ${TIMED_SKU}`, "SKIP", `no product with sku ${TIMED_SKU}`);
+    } else {
+      // The stock ledger page, one SKU, exactly the columns it selects.
+      await timedProbe("Owner screens", `ledger: stock_movements for ${TIMED_SKU}`, "allowed", () =>
+        owner.client
+          .from("stock_movements")
+          .select("movement_id, movement_ts, movement_type, quantity, balance_after, reference, note, supplier, user_id")
+          .eq("product_id", product.product_id)
+          .order("movement_ts", { ascending: true })
+          .order("movement_id", { ascending: true })
+          .range(0, 999)
+      );
+
+      // products/delete's three counts, which decide deactivate vs delete.
+      for (const [tbl, col] of [
+        ["sale_items", "sale_item_id"],
+        ["stock_movements", "movement_id"],
+        ["alerts", "alert_id"],
+      ]) {
+        const { count, error } = await owner.client
+          .from(tbl)
+          .select(col, { count: "exact", head: true })
+          .eq("product_id", product.product_id);
+        record(
+          "Owner screens",
+          `products/delete count: ${tbl}`,
+          error ? "FAIL" : "PASS",
+          error ? `"${error.message.slice(0, 60)}"` : `${fmtInt(count ?? 0)} rows`
+        );
+      }
+    }
+
+    // Decision Support: the newest alert batch, then that batch's rows.
+    // This is the read that runs on every Decision Support page load.
+    await timedProbe("Owner screens", "decision support: newest alert batch", "allowed", () =>
+      owner.client
+        .from("alerts")
+        .select("batch_id, generated_ts")
+        .order("generated_ts", { ascending: false })
+        .order("alert_id", { ascending: false })
+        .limit(1)
+    );
+    const { data: newest } = await owner.client
+      .from("alerts")
+      .select("batch_id")
+      .order("generated_ts", { ascending: false })
+      .order("alert_id", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (!newest) {
+      record("Owner screens", "decision support: that batch's rows", "SKIP", "no alert batches exist");
+    } else {
+      await timedProbe("Owner screens", "decision support: that batch's rows", "allowed", () =>
+        owner.client
+          .from("alerts")
+          .select("product_id, alert_type, severity")
+          .eq("batch_id", newest.batch_id)
+          .order("alert_id")
+          .range(0, 999)
+      );
+    }
+
+    // The owner still reaches the cost columns the functions exist to
+    // mediate - through the functions, never through the table. 034 revoked
+    // them from `authenticated`, and the owner is `authenticated` too, so
+    // this is expected to be DENIED and says so.
+    await probe("Owner screens", "products.unit_cost directly (owner is `authenticated` too)", AFTER ? "denied" : "allowed", () =>
+      owner.client.from("products").select("sku, unit_cost").limit(1)
+    );
+
+    // ----------------------------------------- the real owner, untouched
+    const { data: ownersAfter, error: afterError } = await admin
+      .from("profiles")
+      .select("id, username")
+      .eq("role", "owner");
+    const after = (ownersAfter ?? []).map((o) => o.id).sort();
+    const stillThere = after.filter((id) => id !== owner.id).sort();
+    record(
+      "The real owner",
+      "the real owner list is unchanged",
+      !afterError && JSON.stringify(stillThere) === JSON.stringify(before) ? "PASS" : "FAIL",
+      afterError
+        ? `"${afterError.message.slice(0, 60)}"`
+        : `${fmtInt(before.length)} before, ${fmtInt(stillThere.length)} after (the temporary one excluded)`
+    );
+    record(
+      "The real owner",
+      "the temporary owner was the only one added",
+      after.length === before.length + 1 ? "PASS" : "FAIL",
+      `${fmtInt(after.length)} owner row${after.length === 1 ? "" : "s"} while the checks ran`
+    );
+  }
+
   // ------------------------------------------------------------- report
   const groups = [...new Set(results.map((r) => r.group))];
   for (const group of groups) {
@@ -555,6 +850,12 @@ try {
         "Owner-only functions": "must be DENIED in both modes - the check is inside the function",
         "No-profile caller":
           "current_user_role() is NULL here: every owner_* function, and both undo RPCs, must DENY",
+        "Owner functions":
+          "all seven must be ALLOWED and must RETURN ROWS - an empty owner screen is the bug",
+        "Owner screens":
+          "the owner's direct reads must work; the cost columns must not be among them",
+        "The real owner":
+          "nothing here may touch the one real owner account",
         "Editing a sale":
           "edit_sale must be DENIED in both modes (035, not 034) - and undo must NOT be",
         "Provenance tag":
@@ -566,6 +867,13 @@ try {
     for (const r of results.filter((x) => x.group === group)) {
       console.log(`  ${r.outcome.padEnd(4)}  ${r.label.padEnd(58)} ${r.detail}`);
     }
+  }
+
+  if (timings.length > 0) {
+    section("Timings");
+    console.log("  One sample each, as an owner, over the public internet. Useful for the");
+    console.log("  shape of a change, not as a benchmark.\n");
+    for (const t of timings) console.log(`  ${String(fmtInt(t.ms)).padStart(7)} ms  ${t.label}`);
   }
 
   const failed = results.filter((r) => r.outcome === "FAIL");
