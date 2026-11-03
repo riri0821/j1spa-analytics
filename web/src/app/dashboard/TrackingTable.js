@@ -84,54 +84,40 @@ export default function TrackingTable({ rows }) {
               <th className="px-3 py-2 font-normal">Movement</th>
               {/* "Balance" rather than "Stock level" so it reads as the same
                   figure as the Balance column in the ledger this SKU opens. */}
-              <th className="px-3 py-2 font-normal">Balance</th>
+              <th className="px-3 py-2 text-right font-normal">Balance</th>
               <th className="px-3 py-2 font-normal">Status</th>
             </tr>
           </thead>
           <tbody>
-            {paginated.map((r) => {
-              const gaugeMax = Math.max(r.reorderPoint * 3, r.stockOnHand, 1);
-              const pct = Math.min(100, Math.round((r.stockOnHand / gaugeMax) * 100));
-              return (
-                <tr key={r.sku} className="border-t" style={{ borderColor: theme.border }}>
-                  <td className="px-3 py-2 font-mono">
-                    <a href={`/ledger/${encodeURIComponent(r.sku)}`} style={{ color: CATEGORICAL[0] }}>
-                      {r.sku}
-                    </a>
-                  </td>
-                  <td className="px-3 py-2" style={{ color: theme.textPrimary }}>
-                    {r.name}
-                  </td>
-                  <td className="px-3 py-2" style={{ color: theme.textSecondary }}>
-                    {r.category}
-                  </td>
-                  <td className="px-3 py-2" style={{ color: theme.textSecondary }}>
-                    {r.movement}
-                  </td>
-                  <td className="px-3 py-2">
-                    <div className="flex items-center gap-2">
-                      <div className="h-1.5 w-24 rounded-full" style={{ backgroundColor: theme.cardBgAlt }}>
-                        <div
-                          className="h-1.5 rounded-full"
-                          style={{ width: `${pct}%`, backgroundColor: STATUS[r.status] }}
-                        />
-                      </div>
-                      <span className="tabular-nums" style={{ color: theme.textSecondary }}>
-                        {r.stockOnHand}
-                      </span>
-                    </div>
-                  </td>
-                  <td className="px-3 py-2">
-                    <span
-                      className="rounded px-2 py-0.5 text-xs font-medium"
-                      style={{ backgroundColor: `${STATUS[r.status]}22`, color: STATUS[r.status] }}
-                    >
-                      {r.status}
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
+            {paginated.map((r) => (
+              <tr key={r.sku} className="border-t" style={{ borderColor: theme.border }}>
+                <td className="px-3 py-2 font-mono">
+                  <a href={`/ledger/${encodeURIComponent(r.sku)}`} style={{ color: CATEGORICAL[0] }}>
+                    {r.sku}
+                  </a>
+                </td>
+                <td className="px-3 py-2" style={{ color: theme.textPrimary }}>
+                  {r.name}
+                </td>
+                <td className="px-3 py-2" style={{ color: theme.textSecondary }}>
+                  {r.category}
+                </td>
+                <td className="px-3 py-2" style={{ color: theme.textSecondary }}>
+                  {r.movement}
+                </td>
+                <td className="px-3 py-2 text-right tabular-nums" style={{ color: theme.textSecondary }}>
+                  {r.stockOnHand}
+                </td>
+                <td className="px-3 py-2">
+                  <span
+                    className="rounded px-2 py-0.5 text-xs font-medium"
+                    style={{ backgroundColor: `${STATUS[r.status]}22`, color: STATUS[r.status] }}
+                  >
+                    {r.status}
+                  </span>
+                </td>
+              </tr>
+            ))}
             {filtered.length === 0 && (
               <tr>
                 <td colSpan={6} className="px-3 py-6 text-center" style={{ color: theme.textMuted }}>
