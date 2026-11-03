@@ -627,13 +627,28 @@ where n.nspname = 'public' and p.proname like 'owner\_%'
 order by p.proname;
 */
 
--- b. Every one carries the role check. MUST be true for all seven.
+-- b. Every one carries the NULL-safe role check, and none carries the
+--    plain `<>` form that fails open on a null role. For all seven,
+--    null_safe_check must be true and unsafe_check false.
 
 /*
-select p.proname, p.prosrc like '%current_user_role() <> ''owner''%' as has_owner_check
+select p.proname,
+       p.prosrc like '%current_user_role() is distinct from ''owner''%' as null_safe_check,
+       p.prosrc like '%current_user_role() <> ''owner''%'               as unsafe_check
 from pg_proc p
 join pg_namespace n on n.oid = p.pronamespace
 where n.nspname = 'public' and p.proname like 'owner\_%'
+order by p.proname;
+*/
+
+-- b2. And the two undo RPCs this file also recreates now raise on a null
+--     role before testing it. Both must be true.
+
+/*
+select p.proname, p.prosrc like '%if v_role is null then%' as guards_null_role
+from pg_proc p
+join pg_namespace n on n.oid = p.pronamespace
+where n.nspname = 'public' and p.proname in ('undo_sale', 'undo_service')
 order by p.proname;
 */
 
