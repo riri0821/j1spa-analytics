@@ -5,6 +5,7 @@ see the PERN migration plan. Only the Next.js backend calls this (with
 FORECAST_SERVICE_KEY, never exposed to the browser), so it doesn't
 duplicate the app's own login - it trusts whoever holds that key."""
 import os
+import secrets
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -46,7 +47,11 @@ app = FastAPI(title="J1SPA Forecasting Service", lifespan=lifespan)
 
 
 def require_internal_key(x_internal_key: str = Header(default="")):
-    if x_internal_key != INTERNAL_KEY:
+    # compare_digest, not !=: a plain string comparison returns as soon as
+    # two bytes differ, which leaks the length of the matching prefix
+    # through response timing. This key guards a service holding the
+    # Supabase service-role key, so it is worth the constant time.
+    if not secrets.compare_digest(x_internal_key, INTERNAL_KEY):
         raise HTTPException(status_code=401, detail="Invalid or missing X-Internal-Key.")
 
 
