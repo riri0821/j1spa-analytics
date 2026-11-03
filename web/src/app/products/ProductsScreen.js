@@ -4,11 +4,12 @@ import { useEffect, useState, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { theme, CATEGORICAL } from "../dashboard/theme";
 import PaginationControls from "@/components/PaginationControls";
+import RowSizeSelect from "@/components/RowSizeSelect";
+import { usePageSize } from "@/lib/pageSize";
 import { CategorySelect, fetchCategoryCounts } from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-2 py-1.5 text-sm w-full";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
-const PAGE_SIZE = 20;
 
 const emptyForm = {
   product_id: null,
@@ -37,7 +38,6 @@ export default function ProductsScreen() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [form, setForm] = useState(null); // null = form closed
-  const [page, setPage] = useState(1);
 
   const loadProducts = useCallback(
     async (term, category) => {
@@ -97,11 +97,20 @@ export default function ProductsScreen() {
     loadProducts(search, next);
   }
 
-  const totalPages = Math.max(1, Math.ceil(products.length / PAGE_SIZE));
-  const currentPage = Math.min(page, totalPages);
-  const paginated = products.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
-  const rangeStart = products.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
-  const rangeEnd = Math.min(currentPage * PAGE_SIZE, products.length);
+  const {
+    rowSize,
+    setRowSize,
+    page: currentPage,
+    setPage,
+    totalPages,
+    start,
+    end,
+    rangeStart,
+    rangeEnd,
+    extended,
+  } = usePageSize(products.length, "products");
+
+  const paginated = products.slice(start, end);
 
   function openCreate() {
     setForm({ ...emptyForm });
@@ -185,6 +194,7 @@ export default function ProductsScreen() {
           </button>
         </form>
         <div className="flex items-center gap-4">
+          <RowSizeSelect value={rowSize} onChange={setRowSize} />
           <PaginationControls
             rangeStart={rangeStart}
             rangeEnd={rangeEnd}
@@ -192,6 +202,9 @@ export default function ProductsScreen() {
             page={currentPage}
             totalPages={totalPages}
             onPageChange={setPage}
+            showEdges={extended}
+            showPageIndicator={extended}
+            showJump={extended}
           />
           <button
             onClick={openCreate}

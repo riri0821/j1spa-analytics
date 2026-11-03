@@ -3,10 +3,15 @@
 import { Fragment, useEffect, useMemo, useState } from "react";
 import { theme, CATEGORICAL } from "../dashboard/theme";
 import PaginationControls from "@/components/PaginationControls";
+import RowSizeSelect from "@/components/RowSizeSelect";
+import { usePageSize } from "@/lib/pageSize";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
-const PAGE_SIZE = 20;
+// One remembered size across every list built from this component (the two
+// trackers, recent sales, recent services) - it is one kind of list to read,
+// whichever screen it is on.
+const ROWS_KEY = "records";
 
 // Generic record list: configurable text search, expandable per-row detail
 // (lazily resolved via fetchDetail), pagination, optional Undo. Each row
@@ -26,7 +31,6 @@ export default function RecordsTable({
   searchPlaceholder = "Search by customer name...",
 }) {
   const [customerSearch, setCustomerSearch] = useState("");
-  const [page, setPage] = useState(1);
   const [expandedKey, setExpandedKey] = useState(null);
   const [detailCache, setDetailCache] = useState({});
 
@@ -59,11 +63,20 @@ export default function RecordsTable({
     return rows.filter((r) => searchFields.some((f) => String(r[f] ?? "").toLowerCase().includes(term)));
   }, [rows, customerSearch, searchFields]);
 
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  const currentPage = Math.min(page, totalPages);
-  const paginated = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
-  const rangeStart = filtered.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
-  const rangeEnd = Math.min(currentPage * PAGE_SIZE, filtered.length);
+  const {
+    rowSize,
+    setRowSize,
+    page: currentPage,
+    setPage,
+    totalPages,
+    start,
+    end,
+    rangeStart,
+    rangeEnd,
+    extended,
+  } = usePageSize(filtered.length, ROWS_KEY);
+
+  const paginated = filtered.slice(start, end);
 
   async function toggleDetails(row) {
     if (expandedKey === row.key) {
@@ -92,14 +105,20 @@ export default function RecordsTable({
           className={`max-w-xs ${inputClass}`}
           style={inputStyle}
         />
-        <PaginationControls
-          rangeStart={rangeStart}
-          rangeEnd={rangeEnd}
-          total={filtered.length}
-          page={currentPage}
-          totalPages={totalPages}
-          onPageChange={setPage}
-        />
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <RowSizeSelect value={rowSize} onChange={setRowSize} />
+          <PaginationControls
+            rangeStart={rangeStart}
+            rangeEnd={rangeEnd}
+            total={filtered.length}
+            page={currentPage}
+            totalPages={totalPages}
+            onPageChange={setPage}
+            showEdges={extended}
+            showPageIndicator={extended}
+            showJump={extended}
+          />
+        </div>
       </div>
 
       <div className="overflow-x-auto rounded border" style={{ borderColor: theme.border }}>

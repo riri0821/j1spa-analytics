@@ -4,14 +4,13 @@ import { useMemo, useState } from "react";
 import { theme, STATUS, CATEGORICAL } from "./theme";
 import Card from "./Card";
 import PaginationControls from "@/components/PaginationControls";
-
-const PAGE_SIZE = 20;
+import RowSizeSelect from "@/components/RowSizeSelect";
+import { usePageSize } from "@/lib/pageSize";
 
 export default function TrackingTable({ rows }) {
   const [category, setCategory] = useState("all");
   const [movement, setMovement] = useState("all");
   const [status, setStatus] = useState("all");
-  const [page, setPage] = useState(1);
 
   const categories = useMemo(() => [...new Set(rows.map((r) => r.category))].sort(), [rows]);
 
@@ -22,15 +21,20 @@ export default function TrackingTable({ rows }) {
       (status === "all" || r.status === status)
   );
 
-  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
-  // Filters change which rows exist, so a page picked before may now be out
-  // of range - clamp it during render instead of stashing another copy of
-  // page state to keep in sync.
-  const currentPage = Math.min(page, totalPages);
+  const {
+    rowSize,
+    setRowSize,
+    page: currentPage,
+    setPage,
+    totalPages,
+    start,
+    end,
+    rangeStart,
+    rangeEnd,
+    extended,
+  } = usePageSize(filtered.length, "tracking");
 
-  const paginated = filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
-  const rangeStart = filtered.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
-  const rangeEnd = Math.min(currentPage * PAGE_SIZE, filtered.length);
+  const paginated = filtered.slice(start, end);
 
   function updateFilter(setter) {
     return (value) => {
@@ -40,14 +44,20 @@ export default function TrackingTable({ rows }) {
   }
 
   const paginationArrows = (
-    <PaginationControls
-      rangeStart={rangeStart}
-      rangeEnd={rangeEnd}
-      total={filtered.length}
-      page={currentPage}
-      totalPages={totalPages}
-      onPageChange={setPage}
-    />
+    <div className="flex flex-wrap items-center justify-end gap-2">
+      <RowSizeSelect value={rowSize} onChange={setRowSize} />
+      <PaginationControls
+        rangeStart={rangeStart}
+        rangeEnd={rangeEnd}
+        total={filtered.length}
+        page={currentPage}
+        totalPages={totalPages}
+        onPageChange={setPage}
+        showEdges={extended}
+        showPageIndicator={extended}
+        showJump={extended}
+      />
+    </div>
   );
 
   return (

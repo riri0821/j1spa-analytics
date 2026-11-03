@@ -4,8 +4,8 @@ import { useEffect, useState } from "react";
 import { theme, CATEGORICAL, ADVISORY_TYPE } from "../dashboard/theme";
 import AdvisoryCard from "./AdvisoryCard";
 import PaginationControls from "@/components/PaginationControls";
-
-const PAGE_SIZE = 20;
+import RowSizeSelect from "@/components/RowSizeSelect";
+import { usePageSize } from "@/lib/pageSize";
 
 const TYPE_LABEL = {
   low_stock: "Low stock",
@@ -36,7 +36,6 @@ export default function AdvisoryList({
   totalUnits,
 }) {
   const [typeFilter, setTypeFilter] = useState(null);
-  const [page, setPage] = useState(1);
 
   const countFor = (type) => (type === NO_ACTION ? noAction.length : (byType[type] ?? 0));
   const unitsFor = (type) => (type === NO_ACTION ? noActionUnits : (unitsByType[type] ?? 0));
@@ -70,11 +69,20 @@ export default function AdvisoryList({
       ? advisories.filter((a) => a.type === typeFilter)
       : advisories;
 
-  const totalPages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
-  const currentPage = Math.min(page, totalPages);
-  const paginated = items.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
-  const rangeStart = items.length === 0 ? 0 : (currentPage - 1) * PAGE_SIZE + 1;
-  const rangeEnd = Math.min(currentPage * PAGE_SIZE, items.length);
+  const {
+    rowSize,
+    setRowSize,
+    page: currentPage,
+    setPage,
+    totalPages,
+    start,
+    end,
+    rangeStart,
+    rangeEnd,
+    extended,
+  } = usePageSize(items.length, "advisories");
+
+  const paginated = items.slice(start, end);
 
   function toggleFilter(type) {
     setTypeFilter((t) => (t === type ? null : type));
@@ -96,14 +104,20 @@ export default function AdvisoryList({
             />
           ))}
         </div>
-        <PaginationControls
-          rangeStart={rangeStart}
-          rangeEnd={rangeEnd}
-          total={items.length}
-          page={currentPage}
-          totalPages={totalPages}
-          onPageChange={setPage}
-        />
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <RowSizeSelect value={rowSize} onChange={setRowSize} />
+          <PaginationControls
+            rangeStart={rangeStart}
+            rangeEnd={rangeEnd}
+            total={items.length}
+            page={currentPage}
+            totalPages={totalPages}
+            onPageChange={setPage}
+            showEdges={extended}
+            showPageIndicator={extended}
+            showJump={extended}
+          />
+        </div>
       </div>
 
       {/* The four chips above partition the active catalog, so these are the
