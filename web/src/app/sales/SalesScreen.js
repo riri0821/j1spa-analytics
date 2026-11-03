@@ -17,6 +17,13 @@ const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border
 export default function SalesScreen({ userId, role, initialTab = "entry" }) {
   const supabase = createClient();
 
+  // Editing a sale is owner-only (migration 035). It is not a correction to
+  // one row: edit_sale hands back the stock every old line took, re-decrements
+  // for the new ones and writes two movements per product, so it rewrites the
+  // ledger and products.stock_on_hand. Staff keep undo, on their own records
+  // from the current Manila day.
+  const isOwner = role === "owner";
+
   const [tab, setTab] = useState(initialTab); // "entry" | "services" | "tracker"
   // Bumped after a sale so both pickers re-read stock_on_hand.
   const [catalogVersion, setCatalogVersion] = useState(0);
@@ -89,13 +96,12 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
         can_undo:
           role === "owner" ||
           (s.user_id === userId && todayInManila(new Date(s.sale_ts)) === today),
-        // edit_sale: the owner, or your own sale - it has no same-day limit,
-        // so neither does the link. Tightening one without the other is what
-        // puts a dead link on the screen.
-        can_edit: role === "owner" || s.user_id === userId,
+        // edit_sale: the owner, any sale, any date. Nobody else, which is
+        // why this does not look at user_id at all.
+        can_edit: isOwner,
       }))
     );
-  }, [supabase, role, userId]);
+  }, [supabase, role, userId, isOwner]);
 
   useEffect(() => {
     // Fetch-on-mount: setState lands before the first await, which is the
@@ -176,6 +182,10 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
 
   async function openEditSale(row) {
     setError("");
+    // Unreachable for staff - onEdit is not even passed below - but the
+    // panel writes through edit_sale, which is owner-only, so the check
+    // belongs next to the thing it protects rather than only at the link.
+    if (!isOwner) return;
     // unit_price comes from products, not sale_items - edit_sale() always
     // re-prices every line at the product's CURRENT price when it saves
     // (same as confirm_sale), so this preview has to show that same price,
@@ -510,7 +520,7 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
           Recent sales
         </h2>
 
-        {editingSale && (
+        {isOwner && editingSale && (
           <div className="flex flex-col gap-3 rounded border p-4" style={{ borderColor: theme.border, backgroundColor: theme.cardBg }}>
             <div className="flex items-center justify-between">
               <h3 className="text-sm font-semibold" style={{ color: theme.textPrimary }}>
@@ -676,7 +686,8 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
           ]}
           fetchDetail={fetchSaleDetail}
           onUndo={handleUndo}
-          onEdit={openEditSale}
+          // Not passed at all for staff, so there is no Edit cell to render.
+          onEdit={isOwner ? openEditSale : undefined}
           emptyMessage="No sales recorded yet."
         />
       </div>

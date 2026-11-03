@@ -38,6 +38,32 @@ the fly rather than a separately-synced star schema.
 Enforced at the page level (role check + redirect) and at the database level, not
 just hidden in the UI.
 
+### What staff may change after recording it
+
+| | owner | staff |
+| --- | --- | --- |
+| Record a sale or service | yes | yes |
+| **Edit** a confirmed sale | any sale, any date | **no** |
+| **Undo** a sale or service | any record, any date | their own, from the current Manila day only |
+
+Editing is owner-only from `035_hide_provenance_and_names.sql`. It is not a
+correction to one row: `edit_sale` hands back the stock every old line took,
+deletes and re-inserts the lines, re-decrements stock for the new ones, and
+writes a `void_increment` and a `sale_decrement` per product - so a staff edit
+was a staff-initiated rewrite of the ledger and of `products.stock_on_hand`.
+Before 035 staff could do that to their own sales on any date.
+
+Undo is deliberately left with staff: it is the fix for the mistake they are
+most likely to have just made, it is bounded to their own records and to today
+in Manila, and it reverses a sale rather than rewriting one. The same-day limit
+is compared in `Asia/Manila` inside `undo_sale`/`undo_service`, and the screens
+use the same Manila date rather than the browser's, so the Undo link and the
+function agree.
+
+The Edit link and the edit panel are not rendered for staff at all, and
+`edit_sale` refuses them regardless - the screen and the database say the same
+thing, which is the point of doing both.
+
 ### How "staff never see cost or profit" is enforced
 
 Row Level Security alone cannot do this. Owner and staff both authenticate as the
@@ -78,8 +104,16 @@ the service-role client behind `requireOwner()`.
 temporary staff user through the admin API, signs in as that user with the anon
 key the browser uses, and tries every cost column, view and function in turn,
 then confirms staff can still do their job (read the product fields Sales Entry
-needs, read sales and services, reach `confirm_sale`). It deletes the temporary
-user in a `finally` block.
+needs, read sales and services, reach `confirm_sale`, and still reach
+`undo_sale` and `undo_service`). It deletes the temporary user in a `finally`
+block.
+
+Three of its groups belong to 035 rather than 034 and hold in either `--expect`
+mode: that `edit_sale` refuses staff and a caller with no profile row while undo
+does not, that `data_origin` is unreadable by staff, and that
+`profile_names()` returns a colleague's display name and nothing else. They
+report FAIL or SKIP until 035 is applied, which is accurate - that is the state
+035 changes.
 
 ```bash
 cd web

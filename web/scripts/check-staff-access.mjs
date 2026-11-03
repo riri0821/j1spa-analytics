@@ -29,10 +29,11 @@
  * owner_* functions as missing and both undo RPCs as FAIL, which is accurate
  * - that is the bypass 033 closes.
  *
- * Two groups belong to migration 035 and likewise hold in both modes: that
- * data_origin is not readable by staff (and that taking it away left the
- * rest of those tables readable), and that profile_names() hands staff a
- * colleague's display name and nothing else about the account. Both report
+ * Three groups belong to migration 035 and likewise hold in both modes:
+ * that edit_sale refuses staff while undo_sale and undo_service do not,
+ * that data_origin is not readable by staff (and that taking it away left
+ * the rest of those tables readable), and that profile_names() hands staff a
+ * colleague's display name and nothing else about the account. They report
  * SKIP until 035 is applied.
  *
  * Writes nothing except the temporary user. Exits 1 if any check fails.
@@ -93,6 +94,32 @@ async function probe(group, label, want, fn) {
   const denied = outcome === "denied" || outcome === "empty";
   const pass = want === "allowed" ? outcome === "allowed" : denied;
   record(group, label, outcome === "missing" ? "SKIP" : pass ? "PASS" : "FAIL", detail);
+}
+
+/**
+ * edit_sale is owner-only from migration 035. Probed with an id that cannot
+ * exist, so nothing is written whatever the answer - and that is also what
+ * makes the answer readable: "Sale not found." means the caller got PAST the
+ * role guard, which is a FAIL. Anything about the owner, or about a missing
+ * profile, is a guard doing its job.
+ */
+function recordEditSaleRefusal(group, label, error) {
+  const message = error?.message ?? "";
+  const guarded = /only the owner|no profile found|not signed in|permission/i.test(message);
+  const gotPastTheGuard = /not found/i.test(message) && !guarded;
+  const absent = /could not find the function|does not exist/i.test(message);
+  if (absent) {
+    record(group, label, "SKIP", "edit_sale does not exist yet");
+    return;
+  }
+  record(
+    group,
+    label,
+    guarded ? "PASS" : "FAIL",
+    message
+      ? `"${message.slice(0, 70)}"${gotPastTheGuard ? "  <- past the role guard: 035 is not applied" : ""}`
+      : "no error at all, which a missing sale id should have produced"
+  );
 }
 
 const admin = createServiceClient();
@@ -278,6 +305,22 @@ try {
         // found." is a FAIL: reaching the row lookup at all means the guard
         // did not fire. Anything mentioning a missing profile is the guard
         // working.
+        // edit_sale is owner-only from 035, and guarded twice over for this
+        // caller: the null-role guard from 033 raises first, and
+        // `is distinct from 'owner'` would refuse them even without it.
+        {
+          const { error } = await ghostClient.rpc("edit_sale", {
+            p_sale_id: -1,
+            items: [{ product_id: 1, qty: 1 }],
+            p_note: "staff access check",
+          });
+          recordEditSaleRefusal(
+            "No-profile caller",
+            "edit_sale() refuses a caller with no profile",
+            error
+          );
+        }
+
         for (const [label, call] of [
           ["undo_sale() refuses a caller with no profile", () => ghostClient.rpc("undo_sale", { p_sale_id: -1 })],
           ["undo_service() refuses a caller with no profile", () => ghostClient.rpc("undo_service", { p_service_id: -1 })],
@@ -297,6 +340,55 @@ try {
         }
       }
     }
+  }
+
+  // ----------------------------------------------------- editing a sale
+  //
+  // Staff could edit their own sales on any date. That is not a correction
+  // to one row: edit_sale hands back the stock every old line took, deletes
+  // and re-inserts the lines, re-decrements stock for the new ones and
+  // writes two movements per product - a staff-initiated rewrite of the
+  // ledger and of products.stock_on_hand. 035 makes it owner-only.
+  //
+  // Both modes: the guard is in 035, not 034. SKIP reads as "035 is not
+  // applied" because a staff caller is then told "Sale not found.", which
+  // means the function ran their request as far as the row lookup.
+  {
+    const { error } = await staff.rpc("edit_sale", {
+      p_sale_id: -1,
+      items: [{ product_id: 1, qty: 1 }],
+      p_note: "staff access check",
+    });
+    recordEditSaleRefusal("Editing a sale", "edit_sale() refuses staff", error);
+  }
+
+  // The read behind the edit panel stays open, and should: it is sale_items
+  // for one sale, which the Sales Tracker's expanded detail shows anyway.
+  // Only the write is owner-only, so the screen hides the panel rather than
+  // the data.
+  await probe("Editing a sale", "sale_items for one sale is still readable", "allowed", () =>
+    staff.from("sale_items").select("product_id, sku, quantity, products(name, unit_price)").limit(1)
+  );
+
+  // Undo is NOT taken away, and a check that only proved the refusal would
+  // miss the whole point: staff still undo their own records from the
+  // current Manila day. Probed with an id that cannot exist - "Sale not
+  // found." is the PASS here, because reaching the row lookup means the role
+  // logic let them through.
+  for (const [label, call] of [
+    ["undo_sale() is still reachable by staff", () => staff.rpc("undo_sale", { p_sale_id: -1 })],
+    ["undo_service() is still reachable by staff", () => staff.rpc("undo_service", { p_service_id: -1 })],
+  ]) {
+    const { error } = await call();
+    const message = error?.message ?? "";
+    const reachedTheLookup = /not found/i.test(message);
+    const refusedForAccess = /only the owner|not allowed|permission|no profile/i.test(message);
+    record(
+      "Editing a sale",
+      label,
+      reachedTheLookup && !refusedForAccess ? "PASS" : "FAIL",
+      message ? `"${message.slice(0, 70)}"` : "no error at all, which a missing id should have produced"
+    );
   }
 
   // -------------------------------------------------- the provenance tag
@@ -463,6 +555,8 @@ try {
         "Owner-only functions": "must be DENIED in both modes - the check is inside the function",
         "No-profile caller":
           "current_user_role() is NULL here: every owner_* function, and both undo RPCs, must DENY",
+        "Editing a sale":
+          "edit_sale must be DENIED in both modes (035, not 034) - and undo must NOT be",
         "Provenance tag":
           "data_origin must be DENIED in both modes (035, not 034); everything beside it must still read",
         "Colleagues' names":
@@ -487,6 +581,9 @@ try {
   for (const r of failed) console.log(`  FAIL  ${r.label}: ${r.detail}`);
   if (!AFTER) {
     const only033 = failed.length > 0 && failed.every((r) => r.group === "No-profile caller");
+    const only035 =
+      failed.length > 0 &&
+      failed.every((r) => r.group === "Editing a sale" || r.group === "Provenance tag" || r.group === "Colleagues' names");
     console.log("  This is the BEFORE picture. The cost reads succeeding is the hole that");
     console.log("  migration 034 closes; re-run with --expect=after once it is applied.");
     if (only033) {
@@ -495,6 +592,14 @@ try {
       console.log("  migration 033 rather than 034. They are expected to fail until 033 is");
       console.log("  run, and are the reason it needs running: a signed-in caller with no");
       console.log("  profile row currently passes straight through undo_sale's role check.");
+    }
+    if (only035) {
+      console.log("");
+      console.log("  The failures above are all in groups that belong to migration 035, not");
+      console.log("  034. They fail until 035 is run, and are the reason it needs running -");
+      console.log("  most of all edit_sale, which a staff caller currently gets as far as the");
+      console.log("  row lookup: today they can rewrite their own sale, and the ledger with");
+      console.log("  it. Run 035 and re-run this.");
     }
   }
   process.exitCode = failed.length ? 1 : 0;

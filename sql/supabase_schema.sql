@@ -708,16 +708,30 @@ begin
     raise exception 'No profile found for this account.';
   end if;
 
+  -- Editing a confirmed sale is owner-only. It is not a correction to one
+  -- row: it hands back the stock every old line took, deletes and re-inserts
+  -- the lines, re-decrements stock for the new ones and writes a
+  -- void_increment and a sale_decrement for each - so a staff edit of their
+  -- own sale was a staff-initiated rewrite of the ledger, and of
+  -- products.stock_on_hand with it. Staff undo instead, which is still
+  -- theirs to do on their own records from the current Manila day
+  -- (undo_sale, undo_service - unchanged).
+  --
+  -- `is distinct from` rather than `<>`: `NULL <> 'owner'` is NULL and a
+  -- plpgsql IF treats NULL as false, so `<>` would skip this guard entirely
+  -- for a caller with no profile row. The null-role guard above already
+  -- refuses that caller; this says the same thing again rather than relying
+  -- on one of them being there.
+  if v_role is distinct from 'owner' then
+    raise exception 'Only the owner can edit a sale.';
+  end if;
+
   select * into v_sale from sales where sale_id = p_sale_id for update;
   if not found then
     raise exception 'Sale not found.';
   end if;
   if v_sale.status = 'voided' then
     raise exception 'Cannot edit a voided sale.';
-  end if;
-
-  if v_role <> 'owner' and v_sale.user_id is distinct from v_uid then
-    raise exception 'Not allowed to edit this sale.';
   end if;
 
   if items is null or jsonb_array_length(items) = 0 then
