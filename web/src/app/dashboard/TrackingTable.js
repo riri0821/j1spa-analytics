@@ -81,11 +81,11 @@ export default function TrackingTable({ rows }) {
               <th className="px-3 py-2 font-normal">SKU</th>
               <th className="px-3 py-2 font-normal">Item name</th>
               <th className="px-3 py-2 font-normal">Category</th>
-              <th className="px-3 py-2 font-normal">Movement</th>
+              <th className="w-36 px-3 py-2 font-normal">Movement</th>
               {/* "Balance" rather than "Stock level" so it reads as the same
                   figure as the Balance column in the ledger this SKU opens. */}
-              <th className="w-24 px-3 py-2 text-center font-normal">Balance</th>
-              <th className="px-3 py-2 font-normal">Status</th>
+              <th className="w-32 px-3 py-2 text-center font-normal">Balance</th>
+              <th className="w-36 py-2 pl-8 pr-3 font-normal">Status</th>
             </tr>
           </thead>
           <tbody>
@@ -108,7 +108,7 @@ export default function TrackingTable({ rows }) {
                 <td className="px-3 py-2 text-center tabular-nums" style={{ color: theme.textSecondary }}>
                   {r.stockOnHand}
                 </td>
-                <td className="px-3 py-2">
+                <td className="py-2 pl-8 pr-3">
                   <span
                     className="rounded px-2 py-0.5 text-xs font-medium"
                     style={{ backgroundColor: `${STATUS[r.status]}22`, color: STATUS[r.status] }}
