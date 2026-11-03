@@ -1019,8 +1019,8 @@ language sql
 stable
 as $$
   select
-    extract(year from s.sale_ts)::int as year,
-    extract(month from s.sale_ts)::int as month,
+    extract(year from (s.sale_ts at time zone 'Asia/Manila'))::int as year,
+    extract(month from (s.sale_ts at time zone 'Asia/Manila'))::int as month,
     sum(si.quantity)::numeric as units
   from sale_items si
   join sales s    on s.sale_id = si.sale_id
@@ -1043,8 +1043,8 @@ stable
 as $$
   select
     p.sku,
-    extract(year from s.sale_ts)::int as year,
-    extract(month from s.sale_ts)::int as month,
+    extract(year from (s.sale_ts at time zone 'Asia/Manila'))::int as year,
+    extract(month from (s.sale_ts at time zone 'Asia/Manila'))::int as month,
     sum(si.quantity)::numeric as units
   from sale_items si
   join sales s    on s.sale_id = si.sale_id
@@ -1103,7 +1103,7 @@ language sql
 stable
 as $$
   -- "Sales" = sales + services combined (services at zero cost), matching
-  -- dashboard_gross_net_summary. See sql/migrations/024_fix_kpi_include_services.sql.
+  -- the Gross & Net chart. See sql/migrations/024_fix_kpi_include_services.sql.
   with combined as (
     select sale_ts as ts, total_amount as amount, total_cost as cost
     from sales
@@ -1125,139 +1125,19 @@ revoke execute on function sales_kpi_summary() from public;
 revoke execute on function sales_kpi_summary() from anon;
 grant execute on function sales_kpi_summary() to authenticated, service_role;
 
--- Dashboard's Gross & Net chart: combines sales (which have a cost, so
--- net = revenue - cost) and services (manual entry, no cost tracked, so
--- net = gross for that row) into one per-period timeline. Each granularity
--- gets a fixed calendar window, zero-filled so a no-sales period still
--- shows as a $0 bar instead of silently vanishing (see
--- migrations/017_fix_gross_net_windows.sql for the full rationale):
---   day   - the last 30 calendar days through today
---   week  - this calendar month only, cut into fixed 7-day chunks
---           (1-7, 8-14, 15-21, 22-28, 29-end), not Mon-Sun ISO weeks,
---           which would spill into the neighboring month at the edges
---   month - Jan 1 of this year through the current month
---   year  - most recent p_periods years that have data (p_periods is
---           only read by this branch - day/week/month windows are fixed
---           by the calendar, not a row count)
-create or replace function dashboard_gross_net_summary(p_granularity text, p_periods integer default 12)
-returns table(
-  period_start date,
-  gross numeric,
-  net numeric
-)
-language plpgsql
-stable
-as $$
-declare
-  v_today date := current_date;
-begin
-  if p_granularity = 'day' then
-    return query
-      with combined as (
-        select sale_ts::date as ts, total_amount as amount, total_cost as cost
-        from sales where status = 'confirmed'
-        union all
-        select service_ts::date as ts, total_amount as amount, 0::numeric as cost
-        from services where status = 'confirmed'
-      ),
-      days as (
-        select generate_series(v_today - 29, v_today, interval '1 day')::date as d
-      )
-      select
-        days.d as period_start,
-        coalesce(sum(combined.amount), 0) as gross,
-        coalesce(sum(combined.amount - combined.cost), 0) as net
-      from days
-      left join combined on combined.ts = days.d
-      group by days.d
-      order by days.d asc;
+-- dashboard_gross_net_summary() was dropped in
+-- sql/migrations/032_fix_batch_2.sql: superseded by
+-- dashboard_gross_net_range() below, which the Gross & Net chart has
+-- called since migration 028, and nothing referenced it any more. It
+-- bucketed on a UTC date cast, so keeping it would have left a function
+-- answering the same question wrongly for whoever found it next.
 
-  elsif p_granularity = 'week' then
-    return query
-      with combined as (
-        select sale_ts::date as ts, total_amount as amount, total_cost as cost
-        from sales where status = 'confirmed'
-        union all
-        select service_ts::date as ts, total_amount as amount, 0::numeric as cost
-        from services where status = 'confirmed'
-      ),
-      month_bounds as (
-        select
-          date_trunc('month', v_today)::date as m_start,
-          (date_trunc('month', v_today) + interval '1 month' - interval '1 day')::date as m_end
-      ),
-      buckets as (
-        select
-          (m_start + (n * 7)) as bucket_start,
-          least(m_start + (n * 7) + 6, m_end) as bucket_end
-        from month_bounds, generate_series(0, 4) as n
-        where (m_start + (n * 7)) <= m_end
-          and (m_start + (n * 7)) <= v_today
-      )
-      select
-        buckets.bucket_start as period_start,
-        coalesce(sum(combined.amount), 0) as gross,
-        coalesce(sum(combined.amount - combined.cost), 0) as net
-      from buckets
-      left join combined on combined.ts between buckets.bucket_start and buckets.bucket_end
-      group by buckets.bucket_start, buckets.bucket_end
-      order by buckets.bucket_start asc;
-
-  elsif p_granularity = 'month' then
-    return query
-      with combined as (
-        select sale_ts::date as ts, total_amount as amount, total_cost as cost
-        from sales where status = 'confirmed'
-        union all
-        select service_ts::date as ts, total_amount as amount, 0::numeric as cost
-        from services where status = 'confirmed'
-      ),
-      months as (
-        select generate_series(date_trunc('year', v_today), date_trunc('month', v_today), interval '1 month')::date as m
-      )
-      select
-        months.m as period_start,
-        coalesce(sum(combined.amount), 0) as gross,
-        coalesce(sum(combined.amount - combined.cost), 0) as net
-      from months
-      left join combined on date_trunc('month', combined.ts)::date = months.m
-      group by months.m
-      order by months.m asc;
-
-  else -- 'year' - unchanged trailing-periods-with-data behavior
-    return query
-      with combined as (
-        select sale_ts as ts, total_amount as amount, total_cost as cost
-        from sales where status = 'confirmed'
-        union all
-        select service_ts as ts, total_amount as amount, 0::numeric as cost
-        from services where status = 'confirmed'
-      )
-      select recent.period_start, recent.gross, recent.net from (
-        select
-          date_trunc('year', ts)::date as period_start,
-          sum(amount)        as gross,
-          sum(amount - cost) as net
-        from combined
-        group by date_trunc('year', ts)::date
-        order by date_trunc('year', ts)::date desc
-        limit p_periods
-      ) recent
-      order by recent.period_start asc;
-  end if;
-end;
-$$;
-
-revoke execute on function dashboard_gross_net_summary(text, integer) from public;
-revoke execute on function dashboard_gross_net_summary(text, integer) from anon;
-grant execute on function dashboard_gross_net_summary(text, integer) to authenticated, service_role;
 
 -- dashboard_gross_net_range(): the same revenue definition as
--- dashboard_gross_net_summary() above, but for an arbitrary date range in
--- explicit buckets - what the chart's calendar start-date picker needs.
+-- the Gross & Net chart needs, for an arbitrary date range in
+-- explicit buckets, driven by the chart's calendar period picker.
 -- Buckets on Manila local time rather than a UTC date cast, so a sale made
--- between midnight and 8 AM Manila is counted on the day it happened; the
--- function above is left as it is. Empty buckets come back as zero rows.
+-- between midnight and 8 AM Manila is counted on the day it happened. Empty buckets come back as zero rows.
 -- See sql/migrations/028_add_gross_net_range.sql.
 
 create or replace function dashboard_gross_net_range(
@@ -1348,7 +1228,7 @@ grant execute on function dashboard_gross_net_range(date, date, text) to authent
 -- =====================================================================
 --  Add: dashboard_margin_trend() - trailing 12 calendar months (including
 --  the current one) of sales + services gross & net, for the hero card's
---  margin sparkline. Separate from dashboard_gross_net_summary() on
+--  margin sparkline. Separate from the Gross & Net chart's own series on
 --  purpose: that function's 'month' branch is calendar-year-to-date and the
 --  Gross & Net chart depends on that behavior.
 --
@@ -1369,17 +1249,20 @@ language sql
 stable
 as $$
   with combined as (
-    select sale_ts::date as ts, total_amount as amount, total_cost as cost
+    select (sale_ts at time zone 'Asia/Manila')::date as ts, total_amount as amount, total_cost as cost
     from sales where status = 'confirmed'
     union all
-    select service_ts::date as ts, total_amount as amount, 0::numeric as cost
+    select (service_ts at time zone 'Asia/Manila')::date as ts, total_amount as amount, 0::numeric as cost
     from services where status = 'confirmed'
   ),
+  today as (
+    select (now() at time zone 'Asia/Manila')::date as d
+  ),
   points as (
-    select (date_trunc('month', current_date) - make_interval(months => n) - interval '1 day')::date as p
-    from generate_series(0, 10) as n
+    select (date_trunc('month', today.d) - make_interval(months => n) - interval '1 day')::date as p
+    from generate_series(0, 10) as n, today
     union all
-    select current_date
+    select today.d from today
   )
   select
     points.p as period_start,
