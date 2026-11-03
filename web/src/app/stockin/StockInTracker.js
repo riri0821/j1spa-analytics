@@ -5,6 +5,7 @@ import { createClient } from "@/lib/supabase/client";
 import { pagedQuery } from "@/lib/analytics";
 import { theme } from "../dashboard/theme";
 import RecordsTable from "../sales/RecordsTable";
+import { formatManilaDateTime } from "@/lib/ledger";
 import DateWindowPicker, { useDateWindow } from "@/components/DateWindowPicker";
 
 function money(n) {
@@ -161,7 +162,7 @@ export default function StockInTracker() {
           searchFields={["sku", "name", "supplier"]}
           searchPlaceholder="Search by SKU, item, or supplier..."
           columns={[
-            { label: "Time", render: (r) => new Date(r.movement_ts).toLocaleString() },
+            { label: "Time", render: (r) => formatManilaDateTime(r.movement_ts) },
             { label: "SKU", render: (r) => r.sku },
             { label: "Item", render: (r) => r.name },
             { label: "Supplier", render: (r) => r.supplier ?? "-" },

@@ -6,6 +6,7 @@ import { theme } from "../dashboard/theme";
 import SalesTracker from "./SalesTracker";
 import ServicesScreen from "./ServicesScreen";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
+import { formatManilaDateTime } from "@/lib/ledger";
 import CategoryProductPicker from "@/components/CategoryProductPicker";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
@@ -641,7 +642,7 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
           rows={recentSalesRows}
           renderId={(r) => `#${r.sale_id}`}
           columns={[
-            { label: "Time", render: (r) => new Date(r.sale_ts).toLocaleString() },
+            { label: "Time", render: (r) => formatManilaDateTime(r.sale_ts) },
             { label: "Cashier", render: (r) => r.profiles?.full_name ?? "Former staff" },
             { label: "Lines", align: "right", render: (r) => r.lines },
             { label: "Total", align: "right", render: (r) => Number(r.total_amount).toFixed(2) },

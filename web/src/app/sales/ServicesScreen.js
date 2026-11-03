@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { theme } from "../dashboard/theme";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
+import { formatManilaDateTime } from "@/lib/ledger";
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
@@ -198,7 +199,7 @@ export default function ServicesScreen({ userId, role }) {
           rows={recentServices}
           renderId={(r) => `#${r.service_id}`}
           columns={[
-            { label: "Time", render: (r) => new Date(r.service_ts).toLocaleString() },
+            { label: "Time", render: (r) => formatManilaDateTime(r.service_ts) },
             { label: "Cashier", render: (r) => r.profiles?.full_name ?? "Former staff" },
             { label: "Type", render: (r) => r.service_type },
             { label: "Total", align: "right", render: (r) => Number(r.total_amount).toFixed(2) },

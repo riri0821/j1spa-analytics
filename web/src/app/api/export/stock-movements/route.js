@@ -1,6 +1,7 @@
 import { requireOwner } from "@/lib/requireOwner";
 import { createClient } from "@/lib/supabase/server";
 import { toCsv, csvResponse } from "@/lib/csv";
+import { addDays, isValidDate, manilaInstant } from "@/lib/grossNetRange";
 
 const COLUMNS = [
   { key: "movement_id", label: "movement_id" },
@@ -21,16 +22,27 @@ export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const start = searchParams.get("start");
   const end = searchParams.get("end");
-  if (!start || !end) {
+  // Validated, not just present: addDays() on a malformed date builds an
+  // Invalid Date and throws on toISOString(), which would 500 the request
+  // instead of saying what was wrong.
+  if (!isValidDate(start) || !isValidDate(end)) {
     return Response.json({ error: "start and end are required (YYYY-MM-DD)." }, { status: 400 });
   }
-  const endExclusive = new Date(new Date(`${end}T00:00:00Z`).getTime() + 24 * 60 * 60 * 1000).toISOString();
+  if (start > end) {
+    return Response.json({ error: "start must not be after end." }, { status: 400 });
+  }
+  // Manila day bounds, not UTC ones. `${end}T00:00:00Z` put the window
+  // eight hours out from every screen in the app, so a CSV for a given date
+  // range quietly disagreed with the totals the Sales Tracker showed for the
+  // same dates - the worst kind of reporting bug, because both look right.
+  const startInstant = manilaInstant(start);
+  const endExclusive = manilaInstant(addDays(end, 1));
 
   const supabase = await createClient();
   const { data, error } = await supabase
     .from("stock_movements")
     .select("movement_id, movement_ts, sku, movement_type, quantity, balance_after, reference, note, products(name)")
-    .gte("movement_ts", `${start}T00:00:00Z`)
+    .gte("movement_ts", startInstant)
     .lt("movement_ts", endExclusive)
     .order("movement_id");
 

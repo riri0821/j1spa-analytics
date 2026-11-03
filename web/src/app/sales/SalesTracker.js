@@ -5,6 +5,7 @@ import { createClient } from "@/lib/supabase/client";
 import { pagedQuery } from "@/lib/analytics";
 import { theme } from "../dashboard/theme";
 import RecordsTable, { CustomerDetail } from "./RecordsTable";
+import { formatManilaDateTime } from "@/lib/ledger";
 import DateWindowPicker, { useDateWindow } from "@/components/DateWindowPicker";
 
 // .in() goes into the request URL, so a year of sales would build a query
@@ -196,7 +197,7 @@ export default function SalesTracker({ role }) {
           rows={records}
           renderId={(r) => `#${r.sale_id ?? r.service_id}`}
           columns={[
-            { label: "Time", render: (r) => new Date(r.ts).toLocaleString() },
+            { label: "Time", render: (r) => formatManilaDateTime(r.ts) },
             { label: "Type", render: (r) => r.kind },
             { label: "Cashier", render: (r) => r.profiles?.full_name ?? "Former staff" },
             { label: "Detail", render: (r) => r.detail },

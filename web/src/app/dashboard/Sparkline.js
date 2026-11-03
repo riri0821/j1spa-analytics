@@ -2,6 +2,7 @@
 
 import { LineChart, Line, Tooltip, ResponsiveContainer, XAxis, YAxis } from "recharts";
 import { theme, DELTA_UP } from "./theme";
+import { formatManilaDate } from "@/lib/ledger";
 
 // Axis-free trend line with a dot on the latest point. The hover tooltip is
 // the only floating element, so it's the only thing that gets a shadow.
@@ -9,7 +10,9 @@ export default function Sparkline({ data, color = DELTA_UP, suffix = "%" }) {
   if (!data || data.length < 2) return null;
 
   const last = data.length - 1;
-  const label = (d) => `90 days to ${new Date(d).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}`;
+  // Manila, like every other date in the app - toLocaleDateString with no
+  // timeZone renders in whatever zone the viewer's machine is in.
+  const label = (d) => `90 days to ${formatManilaDate(d)}`;
 
   return (
     <ResponsiveContainer width="100%" height={64}>
