@@ -17,9 +17,11 @@ import {
 import { makeRand, manilaParts, randInt, STORE_CLOSE_HOUR, STORE_OPEN_HOUR } from "./lib/seedlib.mjs";
 import { planDelivery } from "./simulate-recent-activity.mjs";
 import {
+  backupPrecondition,
   countRewrittenRows,
   planProductWindow,
   planWindowDeliveries,
+  rechainAfterDeletions,
   rechainAfterWindow,
   rechainWindow,
   splitAroundWindow,
@@ -715,6 +717,93 @@ const HISTORY = [
   is("an untouched existing row is not counted",
     countRewrittenRows([{ movement_id: 9, balance_after: 12, previousBalanceAfter: 12 }]), 0);
   is("an empty window has nothing to rewrite", countRewrittenRows([]), 0);
+}
+
+// ------------------------- cleanup: the chain after rows are DELETED
+//
+// The mirror image of the gap fill. Dropping a movement shifts every later
+// balance_after by its quantity, and stock_on_hand with it, so the chain has
+// to be rewalked rather than nudged.
+
+{
+  // 50 in, 8 out (a test sale), 5 out, 10 in: ends at 47.
+  const chain = [
+    mv(1, 1000, 50, 50),
+    mv(2, 2000, -8, 42),
+    mv(3, 3000, -5, 37),
+    mv(4, 4000, 10, 47),
+  ];
+
+  const dropOne = rechainAfterDeletions({ movements: chain, deletedIds: new Set([2]) });
+  is("deleting a sale shifts every later balance up by its quantity",
+    dropOne.updates.map((u) => [u.movement_id, u.previousBalanceAfter, u.balance_after]),
+    [[3, 37, 45], [4, 47, 55]]);
+  is("the new stock_on_hand is the new closing balance", dropOne.closing, 55);
+  is("the untouched row keeps its balance", dropOne.updates.some((u) => u.movement_id === 1), false);
+
+  // Deleting a stock-in takes units away instead.
+  const dropIn = rechainAfterDeletions({ movements: chain, deletedIds: new Set([4]) });
+  is("deleting a stock-in lowers the closing balance", dropIn.closing, 37);
+  is("and rewrites nothing before it", dropIn.updates, []);
+
+  // Several at once.
+  const dropTwo = rechainAfterDeletions({ movements: chain, deletedIds: new Set([2, 3]) });
+  is("two deletions compose", dropTwo.closing, 60);
+  is("and the survivor is rewritten once",
+    dropTwo.updates.map((u) => [u.movement_id, u.balance_after]), [[4, 60]]);
+
+  // Deleting the FIRST row: the opening balance has to come from the first
+  // SURVIVING row, not from the deleted one.
+  const dropFirst = rechainAfterDeletions({ movements: chain, deletedIds: new Set([1]) });
+  is("deleting the opening row derives the opening from the survivor", dropFirst.opening, 50);
+  is("and leaves the rest where they were", dropFirst.updates, []);
+
+  // Everything gone: back to what the product held before its first movement.
+  const dropAll = rechainAfterDeletions({ movements: chain, deletedIds: new Set([1, 2, 3, 4]) });
+  is("deleting the whole chain returns the pre-history balance", [dropAll.closing, dropAll.kept.length], [0, 0]);
+
+  is("deleting nothing changes nothing",
+    rechainAfterDeletions({ movements: chain, deletedIds: new Set() }).updates, []);
+
+  // The constraint that can block a cleanup: a deletion that takes a later
+  // balance below zero.
+  const tight = [mv(1, 1000, 3, 3), mv(2, 2000, 5, 8), mv(3, 3000, -6, 2)];
+  const breaks = rechainAfterDeletions({ movements: tight, deletedIds: new Set([2]) });
+  is("a deletion that would go negative is visible in minBalance", breaks.minBalance, -3);
+  ok("and the caller can refuse on it", breaks.minBalance < 0, `min ${breaks.minBalance}`);
+
+  // Input order does not matter: PostgREST returns id order, not time order.
+  const shuffled = [chain[2], chain[0], chain[3], chain[1]];
+  is("unsorted input gives the same answer",
+    rechainAfterDeletions({ movements: shuffled, deletedIds: new Set([2]) }).closing, 55);
+}
+
+// ---------------------------- cleanup: the backup precondition
+//
+// --apply refuses unless every table it touches has a backup whose row count
+// matches the plan. A short backup is worse than none: it looks like cover.
+
+{
+  const expected = { sales: 8, sale_items: 14, stock_movements: 22, services: 2 };
+
+  is("a complete backup passes", backupPrecondition(expected, { ...expected }).ok, true);
+
+  const missing = backupPrecondition(expected, { sales: 8, sale_items: 14, stock_movements: 22 });
+  is("a missing backup table is refused", missing.ok, false);
+  ok("and is named", missing.problems.some((p) => p.includes("services") && p.includes("missing")),
+    missing.problems.join("; "));
+
+  const short = backupPrecondition(expected, { ...expected, stock_movements: 21 });
+  is("a short backup is refused", short.ok, false);
+  ok("with both counts reported",
+    short.problems.some((p) => p.includes("21") && p.includes("22")), short.problems.join("; "));
+
+  // A backup holding MORE than the plan is still refused: it means the plan
+  // and the backup were taken against different data.
+  const over = backupPrecondition(expected, { ...expected, sales: 9 });
+  is("a backup that does not match exactly is refused", over.ok, false);
+
+  is("nothing to back up needs no backup", backupPrecondition({}, {}).ok, true);
 }
 
 // ------------------------------------------------------------------- done

@@ -227,3 +227,72 @@ export function rechainAfterWindow({ closing, openingOfAfter, after }) {
 export function countRewrittenRows(rows) {
   return rows.filter((r) => r.movement_id != null && r.balance_after !== r.previousBalanceAfter).length;
 }
+
+// ------------------------------------------------- removing recorded rows
+//
+// The mirror image of the gap fill. Deleting a movement from the middle of a
+// chain shifts every later balance_after by its quantity, and the product's
+// stock_on_hand with it, so both have to be recomputed rather than adjusted.
+
+/**
+ * Walk one product's chain with some rows deleted.
+ *
+ * @param movements every movement for the product, each with
+ *   { movement_id, movement_ts (ms), quantity, balance_after }.
+ * @param deletedIds Set of movement_id to drop.
+ * @returns { updates, closing, minBalance, kept, opening }
+ *   updates   rows whose balance_after changes, with both values
+ *   closing   the balance the chain now ends on, which becomes stock_on_hand
+ *   minBalance the lowest balance reached, which must not be negative
+ *
+ * The opening balance is derived from the first SURVIVING row's recorded
+ * balance minus its own quantity, the same way lib/ledger.js derives a
+ * period's beginning balance. Deriving it from the first row of the original
+ * chain would be wrong when that row is one of the deleted ones.
+ */
+export function rechainAfterDeletions({ movements, deletedIds }) {
+  const sorted = [...movements].sort(
+    (a, b) => a.movement_ts - b.movement_ts || a.movement_id - b.movement_id
+  );
+  const kept = sorted.filter((m) => !deletedIds.has(m.movement_id));
+  if (kept.length === 0) {
+    // Everything went. The product is back to whatever it held before its
+    // first movement, which the original first row still tells us.
+    const opening = sorted.length ? sorted[0].balance_after - sorted[0].quantity : 0;
+    return { updates: [], closing: opening, minBalance: opening, kept, opening };
+  }
+
+  const opening = kept[0].balance_after - kept[0].quantity;
+  let balance = opening;
+  let minBalance = opening;
+  const updates = [];
+  for (const m of kept) {
+    balance += m.quantity;
+    if (balance < minBalance) minBalance = balance;
+    if (balance !== m.balance_after) {
+      updates.push({ movement_id: m.movement_id, previousBalanceAfter: m.balance_after, balance_after: balance });
+    }
+  }
+  return { updates, closing: balance, minBalance, kept, opening };
+}
+
+/**
+ * Whether the backup tables the cleanup needs are present and complete.
+ *
+ * The apply path refuses unless every table it will touch has a backup whose
+ * row count matches the plan exactly. A short backup is worse than none: it
+ * looks like cover and is not.
+ *
+ * @param expected { tableName: rowCount } from the plan.
+ * @param actual { tableName: rowCount | null } read from the database, null
+ *   meaning the backup table is absent.
+ */
+export function backupPrecondition(expected, actual) {
+  const problems = [];
+  for (const [name, count] of Object.entries(expected)) {
+    const have = actual[name];
+    if (have == null) problems.push(`${name}: backup table missing (expected ${count} rows)`);
+    else if (have !== count) problems.push(`${name}: backup holds ${have} rows, plan touches ${count}`);
+  }
+  return { ok: problems.length === 0, problems };
+}
