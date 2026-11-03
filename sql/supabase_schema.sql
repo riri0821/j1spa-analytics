@@ -1288,9 +1288,15 @@ grant execute on function dashboard_margin_trend() to authenticated, service_rol
 --  Owner-only reads of cost and profit.
 --
 --  Every one of these is security definer with a fixed search_path and
---  opens with its own `current_user_role() <> 'owner'` check. They are
---  how the owner screens reach cost once the grants further down have
---  taken the columns away from `authenticated`.
+--  opens with its own `current_user_role() is distinct from 'owner'`
+--  check. They are how the owner screens reach cost once the grants
+--  further down have taken the columns away from `authenticated`.
+--
+--  `is distinct from` rather than `<>`: current_user_role() returns NULL
+--  for an authenticated user with no profile row, and `NULL <> 'owner'` is
+--  NULL, which a plpgsql IF treats as false - so the plain form would skip
+--  the guard and return the cost data. The policies below use the positive
+--  `= 'owner'` form, where NULL filters the row out and fails closed.
 --
 --  See sql/migrations/033_add_owner_cost_access.sql.
 -- =====================================================================
@@ -1326,7 +1332,7 @@ as $$
 declare
   v_term text;
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -1380,7 +1386,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -1415,7 +1421,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -1458,7 +1464,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -1515,7 +1521,7 @@ as $$
 declare
   v_step interval;
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -1607,7 +1613,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -1658,7 +1664,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 

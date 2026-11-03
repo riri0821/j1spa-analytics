@@ -88,7 +88,24 @@ const admin = createServiceClient();
 const stamp = Date.now();
 const email = `staff-check-${stamp}@example.invalid`;
 const password = `Sc-${stamp}-${Math.random().toString(36).slice(2, 10)}`;
+// Every temporary user this run creates, so the finally block can remove all
+// of them however it exits.
+const createdUsers = [];
 let userId = null;
+
+async function makeTempUser(label) {
+  const addr = `staff-check-${stamp}-${label}@example.invalid`;
+  const pw = `Sc-${stamp}-${Math.random().toString(36).slice(2, 12)}`;
+  const { data, error } = await admin.auth.admin.createUser({
+    email: addr,
+    password: pw,
+    email_confirm: true,
+    user_metadata: { full_name: `Staff Access Check (${label})` },
+  });
+  if (error) throw new Error(`could not create the ${label} user: ${error.message}`);
+  createdUsers.push({ id: data.user.id, email: addr });
+  return { id: data.user.id, email: addr, password: pw };
+}
 
 try {
   section(`Staff access check, --expect=${expectArg}`);
@@ -102,6 +119,7 @@ try {
   });
   if (createError) throw new Error(`could not create the temporary user: ${createError.message}`);
   userId = created.user.id;
+  createdUsers.push({ id: userId, email });
   console.log(`  id            : ${userId}`);
 
   // handle_new_user() writes the profile. Confirm it really is staff before
@@ -192,6 +210,75 @@ try {
     await probe("Owner-only functions", label, "denied", call);
   }
 
+  // ----------------------------------------- an authenticated user with NO
+  // profile row.
+  //
+  // current_user_role() is `select role from profiles where id = auth.uid()`,
+  // which returns NULL when there is no row. `NULL <> 'owner'` is NULL, and
+  // a plpgsql IF treats NULL as false, so a guard written `if
+  // current_user_role() <> 'owner' then raise` is SKIPPED for this caller and
+  // the function returns its cost data. 033 uses `is distinct from` instead,
+  // which is NULL-safe; this is what proves it.
+  //
+  // Safe to set up: the profile row is deleted with the service-role client
+  // from a user created seconds earlier that owns no sales, services or
+  // movements, and the auth user itself is removed in the finally block,
+  // which takes any profile row with it (profiles.id cascades from
+  // auth.users).
+  {
+    const ghost = await makeTempUser("noprofile");
+    const { error: delError } = await admin.from("profiles").delete().eq("id", ghost.id);
+    if (delError) {
+      record("No-profile caller", "set-up", "SKIP", `could not remove the profile row: ${delError.message}`);
+    } else {
+      const { count: left } = await admin
+        .from("profiles")
+        .select("id", { count: "exact", head: true })
+        .eq("id", ghost.id);
+      const ghostClient = createAnonClient();
+      const { error: ghostSignIn } = await ghostClient.auth.signInWithPassword({
+        email: ghost.email,
+        password: ghost.password,
+      });
+      if (ghostSignIn) {
+        record("No-profile caller", "sign in", "SKIP", `could not sign in: ${ghostSignIn.message}`);
+      } else {
+        record("No-profile caller", "set-up: authenticated, no profile row", "PASS", `profile rows: ${left ?? 0}`);
+        for (const [label, call] of [
+          ["owner_product_catalog()", () => ghostClient.rpc("owner_product_catalog", { p_search: null, p_category: null, p_limit: 1 })],
+          ["owner_product_performance()", () => ghostClient.rpc("owner_product_performance")],
+          ["owner_sales_kpi_summary()", () => ghostClient.rpc("owner_sales_kpi_summary")],
+          ["owner_margin_trend()", () => ghostClient.rpc("owner_margin_trend")],
+          ["owner_gross_net_range()", () => ghostClient.rpc("owner_gross_net_range", { p_start: "2026-10-01", p_end: "2026-10-07", p_bucket: "day" })],
+          ["owner_stockin_log()", () => ghostClient.rpc("owner_stockin_log", { p_start: "2026-10-01T00:00:00+08:00", p_end: "2026-10-07T00:00:00+08:00" })],
+          ["owner_stockin_by_supplier()", () => ghostClient.rpc("owner_stockin_by_supplier", { p_sku: "J1-0001" })],
+        ]) {
+          await probe("No-profile caller", label, "denied", call);
+        }
+        // The write RPCs that guard on v_role have the same shape. undo_sale
+        // and undo_service are reported here because they read `v_role <>
+        // 'owner'` with no preceding null check, so a caller in this state
+        // skips the staff restriction entirely. Probed with an id that does
+        // not exist, so nothing can be written either way: "Sale not found."
+        // means it got past the role logic, which is the finding.
+        for (const [label, call] of [
+          ["undo_sale() reaches the role check", () => ghostClient.rpc("undo_sale", { p_sale_id: -1 })],
+          ["undo_service() reaches the role check", () => ghostClient.rpc("undo_service", { p_service_id: -1 })],
+        ]) {
+          const { error } = await call();
+          const message = error?.message ?? "";
+          const stoppedEarly = /not signed in|no profile found/i.test(message);
+          record(
+            "No-profile caller",
+            label,
+            stoppedEarly ? "PASS" : "NOTE",
+            message ? `"${message.slice(0, 70)}"` : "no error"
+          );
+        }
+      }
+    }
+  }
+
   // ------------------------------------------------- staff can still work
   await probe("Staff can still work", "products, the columns Sales Entry needs", "allowed", () =>
     staff.from("products").select("product_id, sku, name, category, brand, unit_price, stock_on_hand").eq("is_active", true).limit(5)
@@ -242,7 +329,9 @@ try {
           ? AFTER ? "must be DENIED" : "expected to succeed, documenting the hole"
           : group === "Owner-only functions"
             ? "must be DENIED in both modes - the check is inside the function"
-            : "must be ALLOWED in both modes";
+            : group === "No-profile caller"
+              ? "current_user_role() is NULL here: every owner_* function must still DENY"
+              : "must be ALLOWED in both modes";
     console.log(`  ${want}\n`);
     for (const r of results.filter((x) => x.group === group)) {
       console.log(`  ${r.outcome.padEnd(4)}  ${r.label.padEnd(58)} ${r.detail}`);
@@ -251,13 +340,24 @@ try {
 
   const failed = results.filter((r) => r.outcome === "FAIL");
   const skipped = results.filter((r) => r.outcome === "SKIP");
+  const notes = results.filter((r) => r.outcome === "NOTE");
   section(failed.length === 0 ? "All checks passed" : `${failed.length} CHECK(S) FAILED`);
   if (skipped.length > 0) {
     console.log(`  ${skipped.length} skipped, nothing to conclude from:`);
-    for (const r of skipped) console.log(`    ${r.label.padEnd(40)} ${r.detail}`);
+    // The group matters here: the same seven functions are probed twice,
+    // once as staff and once as a caller with no profile row.
+    for (const r of skipped) console.log(`    ${r.group.padEnd(22)} ${r.label.padEnd(30)} ${r.detail}`);
     console.log("");
   }
   for (const r of failed) console.log(`  FAIL  ${r.label}: ${r.detail}`);
+  if (notes.length > 0) {
+    console.log(`  ${notes.length} noted, not scored - a finding about code this branch does not change:`);
+    for (const r of notes) console.log(`    ${r.label}  ${r.detail}`);
+    console.log("    undo_sale and undo_service compare `v_role <> 'owner'` with no null");
+    console.log("    check first, so a caller with no profile row skips the staff");
+    console.log("    restriction. Fix: add `if v_role is null then raise` as the other");
+    console.log("    write RPCs do, or use `is distinct from`.");
+  }
   if (!AFTER && failed.length === 0) {
     console.log("  This is the BEFORE picture. The cost reads succeeding is the hole that");
     console.log("  migration 034 closes; re-run with --expect=after once it is applied.");
@@ -267,15 +367,18 @@ try {
   console.error(`\nFAILED: ${err.message}`);
   process.exitCode = 1;
 } finally {
-  if (userId) {
-    const { error } = await admin.auth.admin.deleteUser(userId);
-    console.log(
-      error
-        ? `\n  WARNING: the temporary user ${email} could not be deleted: ${error.message}\n  Delete it by hand in Supabase -> Authentication -> Users.`
-        : `\n  temporary user deleted (${email})`
-    );
-    // profiles.id cascades from auth.users, so the profile row goes with it.
-    const { count } = await admin.from("profiles").select("id", { count: "exact", head: true }).eq("id", userId);
-    console.log(`  profile rows left for it: ${count ?? "unknown"}`);
+  // Every user this run created, however it got here.
+  console.log("");
+  for (const u of createdUsers) {
+    const { error } = await admin.auth.admin.deleteUser(u.id);
+    if (error) {
+      console.log(`  WARNING: ${u.email} could not be deleted: ${error.message}`);
+      console.log("    Delete it by hand in Supabase -> Authentication -> Users.");
+      continue;
+    }
+    // profiles.id cascades from auth.users, so any profile row goes with it.
+    const { count } = await admin.from("profiles").select("id", { count: "exact", head: true }).eq("id", u.id);
+    console.log(`  deleted ${u.email}  (profile rows left: ${count ?? "unknown"})`);
   }
+  if (createdUsers.length === 0) console.log("  no temporary users were created");
 }

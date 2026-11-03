@@ -50,6 +50,23 @@
 --  optional decoration: a definer function bypasses the column privileges
 --  034 puts in place, so without the check it would hand staff exactly
 --  what 034 takes away.
+--
+--  `is distinct from`, NOT `<>`. current_user_role() reads
+--
+--    select role from profiles where id = auth.uid()
+--
+--  which returns NULL when there is no matching row - an authenticated user
+--  whose profile row is missing, or a call with no auth.uid() at all. And
+--  `NULL <> 'owner'` is NULL, not true, so a plain `if ... <> 'owner' then`
+--  is SKIPPED in that case and the function goes on to return cost data.
+--  The guard would fail open on exactly the input it exists to stop.
+--  `is distinct from` is NULL-safe: it returns true, and the exception is
+--  raised.
+--
+--  The same shape is safe in an RLS policy, which is why the policies in
+--  supabase_schema.sql read `current_user_role() = 'owner'`: there NULL
+--  means the row is filtered out, so it fails closed. It is only the
+--  negated form inside a plpgsql IF that inverts.
 -- ---------------------------------------------------------------------
 
 
@@ -84,7 +101,7 @@ as $$
 declare
   v_term text;
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -138,7 +155,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -173,7 +190,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -216,7 +233,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -273,7 +290,7 @@ as $$
 declare
   v_step interval;
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -365,7 +382,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
@@ -416,7 +433,7 @@ set search_path = public
 stable
 as $$
 begin
-  if current_user_role() <> 'owner' then
+  if current_user_role() is distinct from 'owner' then
     raise exception 'Owner access only.';
   end if;
 
