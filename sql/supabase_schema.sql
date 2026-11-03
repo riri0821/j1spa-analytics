@@ -1801,15 +1801,20 @@ grant select (
   balance_after, user_id, reference, note, supplier
 ) on stock_movements to authenticated;
 
--- data_origin on the three tables is not a cost column, but it is the same
--- shape of problem: a thing the screens were never meant to say. The lists
--- above already omit it for sales and stock_movements; services has no
--- column grants of its own, so its revoke is explicit. Only the
--- service-role seed scripts read it. See
+-- data_origin is not a cost column, but it is the same shape of problem: a
+-- thing the screens were never meant to say. The lists above already leave
+-- it out for sales and stock_movements. services has no column grants of
+-- its own - and a bare `revoke select (data_origin)` would not help, since a
+-- column revoke does not touch a table-wide grant - so services gets a
+-- column list too, which is every column it has except that one. Only the
+-- service-role seed scripts read data_origin. See
 -- sql/migrations/035_hide_provenance_and_names.sql.
-revoke select (data_origin) on sales           from authenticated;
-revoke select (data_origin) on services        from authenticated;
-revoke select (data_origin) on stock_movements from authenticated;
+revoke select on services from authenticated;
+grant select (
+  service_id, service_ts, user_id, user_role, service_type, total_amount,
+  status, voided_ts, customer_name, customer_contact, customer_address,
+  customer_vehicle_brand
+) on services to authenticated;
 
 -- vw_product_velocity carries gross_profit_90d, so the whole view is
 -- owner-only through owner_product_performance() instead.

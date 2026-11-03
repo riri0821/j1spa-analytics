@@ -45,6 +45,15 @@ alter table sales           drop column if exists data_origin;
 alter table services        drop column if exists data_origin;
 alter table stock_movements drop column if exists data_origin;
 
+-- 035 converted each table's grant for `authenticated` from table-wide to
+-- per-column so it could leave data_origin out. Those column lists are not
+-- undone: with the column gone they cover every column the table has, so
+-- `authenticated` reads exactly what it read before 035. The one visible
+-- difference is that a future column would start out unreadable rather than
+-- readable, which is the safer default and the reason 034 works that way.
+-- To go all the way back on services:
+--   grant select on services to authenticated;
+
 
 -- ---------------------------------------------------------------------
 --  VERIFY (read-only). Uncomment and run after the above.

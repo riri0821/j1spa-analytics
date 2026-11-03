@@ -112,14 +112,44 @@ update stock_movements
  where note in ('seed-backfill', 'simulated')
    and data_origin is not null;
 
--- Not readable by `authenticated`. Migration 034 replaced the table-wide
--- grants on sales and stock_movements with per-column ones, so a new column
--- is already unreadable there - but services still has a table-wide grant,
--- and an explicit revoke is both correct everywhere and says what is meant.
--- Only the service-role scripts read data_origin.
-revoke select (data_origin) on sales           from authenticated;
-revoke select (data_origin) on services        from authenticated;
-revoke select (data_origin) on stock_movements from authenticated;
+-- Not readable by `authenticated`: only the service-role scripts read
+-- data_origin.
+--
+-- `revoke select (data_origin)` on its own would NOT do this. A column
+-- revoke only removes a column-level grant; a role holding table-wide
+-- SELECT still reads every column, the new one included. services has
+-- exactly that table-wide grant, and so do sales and stock_movements until
+-- 034 replaces theirs with per-column lists.
+--
+-- So the grant is converted instead: read back the columns `authenticated`
+-- can select on each table RIGHT NOW, drop data_origin from that list, and
+-- re-grant it per column. Nothing else about the table's readable surface
+-- changes, which is what makes this safe to run either side of 034 - run
+-- before it, the cost columns stay readable and 034 still narrows them
+-- later; run after it, the narrow list is what gets read back, so the cost
+-- columns are not quietly re-granted.
+do $$
+declare
+  t    text;
+  cols text;
+begin
+  foreach t in array array['sales', 'services', 'stock_movements'] loop
+    select string_agg(quote_ident(c.column_name), ', ' order by c.ordinal_position)
+      into cols
+      from information_schema.columns c
+     where c.table_schema = 'public'
+       and c.table_name   = t
+       and c.column_name <> 'data_origin'
+       and has_column_privilege('authenticated', format('public.%I', t)::regclass,
+                                c.column_name, 'SELECT');
+
+    execute format('revoke select on public.%I from authenticated', t);
+    if cols is not null then
+      execute format('grant select (%s) on public.%I to authenticated', cols, t);
+    end if;
+    raise notice '%: granted select on %', t, coalesce(cols, '(nothing)');
+  end loop;
+end $$;
 
 
 -- ---------------------------------------------------------------------
@@ -256,16 +286,32 @@ from services;
 */
 
 -- b. `authenticated` cannot select data_origin on any of the three. MUST
---    return 0 rows.
+--    return three rows, all with can_select = false. has_column_privilege
+--    is the question that matters - it answers for table-wide and
+--    column-level grants together, which a look at column_privileges alone
+--    does not.
 
 /*
-select table_name, column_name
-from information_schema.column_privileges
-where grantee = 'authenticated'
-  and table_schema = 'public'
-  and privilege_type = 'SELECT'
-  and column_name = 'data_origin'
-order by table_name;
+select t as table_name,
+       has_column_privilege('authenticated', ('public.' || t)::regclass,
+                            'data_origin', 'SELECT') as can_select
+from unnest(array['sales', 'services', 'stock_movements']) as t
+order by t;
+*/
+
+-- b2. ...and everything else on those tables still IS readable. One row per
+--     table, listing what `authenticated` can select. Compare against what
+--     the screens ask for; data_origin must not appear.
+
+/*
+select c.table_name, string_agg(c.column_name, ', ' order by c.ordinal_position) as readable
+from information_schema.columns c
+where c.table_schema = 'public'
+  and c.table_name in ('sales', 'services', 'stock_movements')
+  and has_column_privilege('authenticated', ('public.' || c.table_name)::regclass,
+                           c.column_name, 'SELECT')
+group by c.table_name
+order by c.table_name;
 */
 
 -- c. profile_names() returns exactly two columns, and neither is a
