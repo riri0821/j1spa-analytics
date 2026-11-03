@@ -12,7 +12,13 @@ export async function POST(request) {
   if (auth.error) return auth.error;
 
   const supabase = await createClient();
-  const body = await request.json();
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
+  }
   const productId = Number(body.product_id);
   const reorderPoint = Number(body.reorder_point);
 

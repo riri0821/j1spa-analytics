@@ -6,7 +6,13 @@ export async function POST(request) {
   const auth = await requireOwner();
   if (auth.error) return auth.error;
 
-  const { id } = await request.json();
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
+  }
+  const { id } = body;
   if (!id) return NextResponse.json({ error: "id is required." }, { status: 400 });
   if (id === auth.user.id) {
     return NextResponse.json({ error: "You cannot delete your own account." }, { status: 400 });

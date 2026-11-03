@@ -6,7 +6,13 @@ export async function POST(request) {
   const auth = await requireOwner();
   if (auth.error) return auth.error;
 
-  const body = await request.json();
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid request." }, { status: 400 });
+  }
+
   const email = (body.email ?? "").trim().toLowerCase();
   const fullName = (body.name ?? "").trim();
   const password = body.password ?? "";
