@@ -71,11 +71,11 @@ const inWindow = (tsCol, tbl, extra = (q) => q) =>
 
 const counts = {};
 for (const [key, tbl, col, extra] of [
-  ["sales", "sales", "sale_ts", (q) => q.eq("note", "simulated")],
+  ["sales", "sales", "sale_ts", (q) => q.eq("data_origin", "simulated")],
   ["services", "services", "service_ts", (q) => q.gte("service_id", EXPECT.serviceFirst).lte("service_id", EXPECT.serviceLast)],
   ["services_all", "services", "service_ts", (q) => q],
-  ["movements_sale", "stock_movements", "movement_ts", (q) => q.eq("note", "simulated").eq("movement_type", "sale_decrement")],
-  ["movements_in", "stock_movements", "movement_ts", (q) => q.eq("note", "simulated").eq("movement_type", "stock_in")],
+  ["movements_sale", "stock_movements", "movement_ts", (q) => q.eq("data_origin", "simulated").eq("movement_type", "sale_decrement")],
+  ["movements_in", "stock_movements", "movement_ts", (q) => q.eq("data_origin", "simulated").eq("movement_type", "stock_in")],
 ]) {
   const { count, error } = await inWindow(col, tbl, extra);
   if (error) throw new Error(`${key}: ${error.message}`);
@@ -88,7 +88,7 @@ const simSales = await pageAll(
     sb
       .from("sales")
       .select("sale_id")
-      .eq("note", "simulated")
+      .eq("data_origin", "simulated")
       .gte("sale_ts", `${FROM}T00:00:00+08:00`)
       .lt("sale_ts", `${TO}T00:00:00+08:00`)
       .order("sale_id"),
@@ -105,7 +105,7 @@ progressDone("");
 section("1. Rows inside the window");
 table(
   [
-    ["sales (note='simulated')", fmtInt(counts.sales), fmtInt(EXPECT.sales)],
+    ["sales (data_origin='simulated')", fmtInt(counts.sales), fmtInt(EXPECT.sales)],
     ["sale_items for those sales", fmtInt(simItems.length), "-"],
     ["stock_movements sale_decrement", fmtInt(counts.movements_sale), "-"],
     ["stock_movements stock_in", fmtInt(counts.movements_in), "-"],

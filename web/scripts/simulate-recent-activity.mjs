@@ -64,6 +64,8 @@ import {
   WEB_DIR,
 } from "./lib/db.mjs";
 import {
+  ORIGIN_SEED,
+  ORIGIN_SIMULATED,
   addDaysMs,
   deliveryReceipt,
   fmtInt,
@@ -83,8 +85,10 @@ import {
   weightedIndex,
 } from "./lib/seedlib.mjs";
 
-const SIMULATED_NOTE = "simulated";
-const BACKFILL_NOTE = "seed-backfill";
+// The tags live in data_origin now, not in the user-visible note column.
+// Requires migration 035.
+const SIMULATED_ORIGIN = ORIGIN_SIMULATED;
+const BACKFILL_ORIGIN = ORIGIN_SEED;
 const IDS_FILE = resolve(WEB_DIR, "scripts", "simulated-ids.json");
 
 // Services launched in October 2026 - there is nothing earlier to simulate.
@@ -170,7 +174,7 @@ async function main() {
   const { count: backfilled, error: countError } = await sb
     .from("stock_movements")
     .select("*", { count: "exact", head: true })
-    .eq("note", BACKFILL_NOTE);
+    .eq("data_origin", BACKFILL_ORIGIN);
   if (countError) throw new Error(`could not check for the backfill: ${countError.message}`);
   const backfillApplied = (backfilled ?? 0) > 0;
 
@@ -229,14 +233,16 @@ async function main() {
     () =>
       sb
         .from("sales")
-        .select("sale_id, sale_ts, user_id, user_role, total_amount, total_cost, note")
+        .select("sale_id, sale_ts, user_id, user_role, total_amount, total_cost, data_origin")
         .eq("status", "confirmed")
         .order("sale_id"),
     { pageSize, label: "sales" }
   );
   // The seed, excluding the by-hand app sales and anything a previous run of
   // this script added.
-  const seedSales = allSales.filter((s) => s.sale_id < REAL_APP_SALES_FROM && s.note !== SIMULATED_NOTE);
+  const seedSales = allSales.filter(
+    (s) => s.sale_id < REAL_APP_SALES_FROM && s.data_origin !== SIMULATED_ORIGIN
+  );
   progressDone(`seed sales: ${fmtInt(seedSales.length)} of ${fmtInt(allSales.length)} confirmed`);
 
   let lastSeedTs = null;
@@ -300,7 +306,7 @@ async function main() {
     // Already-done check first: gap mode has to be re-runnable, and the
     // marker is a simulated sale inside the window.
     const already = allSales.filter(
-      (x) => x.note === SIMULATED_NOTE &&
+      (x) => x.data_origin === SIMULATED_ORIGIN &&
         Date.parse(x.sale_ts) >= gap.windowStart && Date.parse(x.sale_ts) < gap.windowEnd
     );
     if (already.length > 0) {
@@ -386,7 +392,7 @@ async function main() {
 function printPreconditionHelp() {
   section("PRECONDITION NOT MET - the ledger backfill has not been applied");
   console.log(
-    `  stock_movements holds 0 rows tagged '${BACKFILL_NOTE}'.\n\n` +
+    `  stock_movements holds 0 rows with data_origin='${BACKFILL_ORIGIN}'.\n\n` +
       `  Run this first:\n` +
       `      node scripts/backfill-ledger.mjs --apply\n\n` +
       `  Order matters: backfill-ledger anchors every product's ledger on\n` +
@@ -676,7 +682,8 @@ export function simulate({ products, patterns, startTs, now }) {
           balance_after: next,
           user_id: null,
           reference: deliveryReceipt(ev.ts),
-          note: SIMULATED_NOTE,
+          note: null,
+          data_origin: SIMULATED_ORIGIN,
           movement_ts: toManilaIso(ev.ts),
           supplier: product.supplier ?? null,
           unit_cost: product.unit_cost ?? null,
@@ -698,6 +705,7 @@ export function simulate({ products, patterns, startTs, now }) {
           service_type: pick.type,
           total_amount: amount,
           status: "confirmed",
+          data_origin: SIMULATED_ORIGIN,
           // No invented personal data - only the vehicle brand is set.
           customer_name: null,
           customer_contact: null,
@@ -773,7 +781,8 @@ export function simulate({ products, patterns, startTs, now }) {
           total_amount: revenue,
           total_cost: cost,
           status: "confirmed",
-          note: SIMULATED_NOTE,
+          note: null,
+          data_origin: SIMULATED_ORIGIN,
           source_type: "Direct Sales Entry",
         },
         lines,
@@ -933,7 +942,9 @@ function printTestData({ existingServices, brandedSales, allProducts, allSales }
       detail: `customer_vehicle_brand "${s.customer_vehicle_brand}" - not a real vehicle brand`,
     });
   }
-  const handMade = allSales.filter((s) => s.sale_id >= REAL_APP_SALES_FROM && s.note !== SIMULATED_NOTE);
+  const handMade = allSales.filter(
+    (s) => s.sale_id >= REAL_APP_SALES_FROM && s.data_origin !== SIMULATED_ORIGIN
+  );
   if (handMade.length) {
     rows.push({
       what: "sales",
@@ -1120,8 +1131,8 @@ function printPlan({ plan, patterns, startTs, now, existingServices }) {
 
   section("Simulated id ranges");
   console.log(
-    `  sales    : ${fmtInt(plan.sales.length)} rows, note = 'simulated'\n` +
-      `  services : ${fmtInt(plan.services.length)} rows - no note column, so the service_id\n` +
+    `  sales    : ${fmtInt(plan.sales.length)} rows, data_origin = 'simulated'\n` +
+      `  services : ${fmtInt(plan.services.length)} rows, data_origin = 'simulated'; the service_id\n` +
       `             range is the only handle. Existing services: ${existingServices.map((s) => s.service_id).join(", ") || "none"}\n` +
       `  Real ids are only known once inserted, so --apply appends them to\n` +
       `  scripts/simulated-ids.json as a new entry in its "runs" array.`
@@ -1277,6 +1288,7 @@ export function planGapFill({ products, patterns, movementsByProduct, windowStar
           service_type: pick.type,
           total_amount: amount,
           status: "confirmed",
+          data_origin: SIMULATED_ORIGIN,
           customer_name: null,
           customer_contact: null,
           customer_address: null,
@@ -1326,7 +1338,8 @@ export function planGapFill({ products, patterns, movementsByProduct, windowStar
           total_amount: revenue,
           total_cost: cost,
           status: "confirmed",
-          note: SIMULATED_NOTE,
+          note: null,
+          data_origin: SIMULATED_ORIGIN,
           source_type: "Direct Sales Entry",
         },
         lines,
@@ -1371,7 +1384,8 @@ export function planGapFill({ products, patterns, movementsByProduct, windowStar
         balance_after: null, // filled in by the rechain below
         user_id: null,
         reference: deliveryReceipt(d.ts),
-        note: SIMULATED_NOTE,
+        note: null,
+        data_origin: SIMULATED_ORIGIN,
         movement_ts: toManilaIso(d.ts),
         supplier: product.supplier ?? null,
         unit_cost: product.unit_cost ?? null,
@@ -1398,7 +1412,8 @@ export function planGapFill({ products, patterns, movementsByProduct, windowStar
         movement_type: "sale_decrement",
         quantity: -l.quantity,
         user_id: s.sale.user_id,
-        note: SIMULATED_NOTE,
+        note: null,
+        data_origin: SIMULATED_ORIGIN,
         movement_ts: s.sale.sale_ts,
         supplier: null,
         unit_cost: null,
@@ -1695,8 +1710,9 @@ function printGapPlan({ plan, gap, allSales, allMovements, products, existingSer
   }
   console.log("");
   console.log("  Undo is then: restore those balance_after values from the backup, delete");
-  console.log("  the inserted sales/sale_items/stock_movements by note = 'simulated' inside");
-  console.log("  the window, and the services by the id range recorded in simulated-ids.json.");
+  console.log("  the inserted sales/sale_items/stock_movements by data_origin = 'simulated'");
+  console.log("  inside the window, and the services by data_origin or by the id range");
+  console.log("  recorded in simulated-ids.json.");
   console.log("");
   console.log("  --apply writes only inserts, never updates. It re-proves the zero-rewrite");
   console.log("  precondition against a freshly loaded ledger immediately before writing and");
@@ -1801,6 +1817,7 @@ async function applyGapPlan(sb, plan, gap, pageSize) {
         user_id: m.user_id,
         reference: m.reference,
         note: m.note,
+        data_origin: m.data_origin,
         movement_ts: m.movement_ts,
         supplier: m.supplier,
         unit_cost: m.unit_cost,
@@ -1851,7 +1868,8 @@ async function applyGapPlan(sb, plan, gap, pageSize) {
           balance_after: l.__balanceAfter,
           user_id: s.sale.user_id,
           reference: `sale:${saleId}`,
-          note: SIMULATED_NOTE,
+          note: null,
+          data_origin: SIMULATED_ORIGIN,
           movement_ts: s.sale.sale_ts,
           supplier: null,
           unit_cost: null,
@@ -1907,7 +1925,7 @@ function appendGapManifest({ insertedSales, insertedServices, plan, gap }) {
 
   file.runs.push({
     generatedAt: new Date().toISOString(),
-    note: SIMULATED_NOTE,
+    dataOrigin: SIMULATED_ORIGIN,
     mode: "gap",
     window: { from: toManilaIso(plan.windowStart), to: toManilaIso(plan.windowEnd) },
     sales: { first: saleIds[0] ?? null, last: saleIds.at(-1) ?? null, count: saleIds.length },
@@ -1915,11 +1933,11 @@ function appendGapManifest({ insertedSales, insertedServices, plan, gap }) {
     stockMovements: { count: plan.movements.length + plan.saleMovements.length },
   });
   file.howToRemove = [
-    "Simulated sales and stock_movements carry note = 'simulated'.",
-    "Services have no note column, so use the service_id ranges in runs[].",
-    "delete from stock_movements where note = 'simulated';",
-    "delete from sale_items where sale_id in (select sale_id from sales where note = 'simulated');",
-    "delete from sales where note = 'simulated';",
+    "Simulated rows carry data_origin = 'simulated' (migration 035).",
+    "delete from stock_movements where data_origin = 'simulated';",
+    "delete from sale_items where sale_id in (select sale_id from sales where data_origin = 'simulated');",
+    "delete from sales where data_origin = 'simulated';",
+    "delete from services where data_origin = 'simulated';  -- or by the id ranges in runs[]",
     "delete from services where service_id between <runs[].services.first> and <runs[].services.last>;",
     "-- then recompute products.stock_on_hand, or restore it from the backup schema",
     "-- a run with mode = 'gap' nets to zero per product, so stock_on_hand needs no",
@@ -1967,7 +1985,8 @@ async function applyPlan(sb, plan) {
         balance_after: l.__balanceAfter,
         user_id: s.sale.user_id,
         reference: `sale:${saleId}`,
-        note: SIMULATED_NOTE,
+        note: null,
+        data_origin: SIMULATED_ORIGIN,
         movement_ts: s.sale.sale_ts,
         supplier: null,
         unit_cost: null,
@@ -2027,17 +2046,17 @@ function appendManifest({ insertedSales, insertedServices, plan }) {
 
   file.runs.push({
     generatedAt: new Date().toISOString(),
-    note: SIMULATED_NOTE,
+    dataOrigin: SIMULATED_ORIGIN,
     window: { from: plan.sales[0]?.sale.sale_ts ?? null, to: plan.sales.at(-1)?.sale.sale_ts ?? null },
     sales: { first: saleIds[0] ?? null, last: saleIds.at(-1) ?? null, count: saleIds.length },
     services: { first: serviceIds[0] ?? null, last: serviceIds.at(-1) ?? null, count: serviceIds.length },
   });
   file.howToRemove = [
-    "Simulated sales and stock_movements carry note = 'simulated'.",
-    "Services have no note column, so use the service_id ranges in runs[].",
-    "delete from stock_movements where note = 'simulated';",
-    "delete from sale_items where sale_id in (select sale_id from sales where note = 'simulated');",
-    "delete from sales where note = 'simulated';",
+    "Simulated rows carry data_origin = 'simulated' (migration 035).",
+    "delete from stock_movements where data_origin = 'simulated';",
+    "delete from sale_items where sale_id in (select sale_id from sales where data_origin = 'simulated');",
+    "delete from sales where data_origin = 'simulated';",
+    "delete from services where data_origin = 'simulated';  -- or by the id ranges in runs[]",
     "delete from services where service_id between <runs[].services.first> and <runs[].services.last>;",
     "-- then recompute products.stock_on_hand, or restore it from the backup schema",
   ];

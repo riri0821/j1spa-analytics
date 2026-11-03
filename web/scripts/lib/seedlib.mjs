@@ -8,6 +8,16 @@
 // is positioned by Manila local time, never the machine's zone.
 export const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
 
+// Where a row came from, in stock_movements.data_origin / sales.data_origin /
+// services.data_origin. These used to live in the user-visible `note`
+// column, where "simulated" showed up in the Sales screen's Note column and
+// in both CSV exports - see sql/migrations/035_hide_provenance_and_names.sql.
+// `note` is now only ever a note somebody typed.
+//
+// Requires migration 035. Run it before any of these scripts.
+export const ORIGIN_SEED = "seed";
+export const ORIGIN_SIMULATED = "simulated";
+
 export const STORE_OPEN_HOUR = 8; // 8 AM
 export const STORE_CLOSE_HOUR = 18; // 6 PM (exclusive)
 

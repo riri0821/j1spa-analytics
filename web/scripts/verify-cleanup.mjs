@@ -175,13 +175,13 @@ async function main(path) {
   for (const r of inserted) {
     const { data } = await sb
       .from("stock_movements")
-      .select("movement_id, sku, quantity, balance_after, supplier, unit_cost, note")
+      .select("movement_id, sku, quantity, balance_after, supplier, unit_cost, data_origin")
       .eq("product_id", r.product_id)
       .eq("movement_ts", r.movement_ts)
-      .eq("note", "simulated");
-    for (const m of data ?? []) found.push([m.sku, String(m.quantity), String(m.balance_after), m.supplier ?? "-", String(m.unit_cost ?? "-"), m.note]);
+      .eq("data_origin", "simulated");
+    for (const m of data ?? []) found.push([m.sku, String(m.quantity), String(m.balance_after), m.supplier ?? "-", String(m.unit_cost ?? "-"), m.data_origin]);
   }
-  table(found, cols("sku", "qty", "balance after", "supplier", "unit cost", "note"));
+  table(found, cols("sku", "qty", "balance after", "supplier", "unit cost", "data origin"));
   check("both rescue restocks are present", found.length === inserted.length, `${found.length} of ${inserted.length}`);
 
   section(failures === 0 ? "All checks passed" : `${failures} CHECK(S) FAILED`);

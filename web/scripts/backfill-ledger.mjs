@@ -16,7 +16,7 @@
  * written by this script, and every product's ledger is built to end exactly
  * on it (see lib/ledgerPlan.mjs for why the walk runs backwards).
  *
- * Every row this script inserts carries note = 'seed-backfill', so the whole
+ * Every row this script inserts carries data_origin = 'seed', so the whole
  * backfill can be found or removed with one predicate.
  */
 
@@ -31,6 +31,7 @@ import {
 } from "./lib/db.mjs";
 import { planProductLedger, verifyPlan } from "./lib/ledgerPlan.mjs";
 import {
+  ORIGIN_SEED,
   fmtInt,
   makeRand,
   manilaDateString,
@@ -42,7 +43,9 @@ import {
   toManilaIso,
 } from "./lib/seedlib.mjs";
 
-export const BACKFILL_NOTE = "seed-backfill";
+// Kept as a named export under its old name so nothing that imports it
+// breaks; the value is the data_origin tag now, not a note.
+export const BACKFILL_ORIGIN = ORIGIN_SEED;
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -79,19 +82,19 @@ async function main() {
     () =>
       sb
         .from("stock_movements")
-        .select("movement_id, movement_ts, product_id, sku, movement_type, quantity, balance_after, user_id, reference, note, supplier, unit_cost")
+        .select("movement_id, movement_ts, product_id, sku, movement_type, quantity, balance_after, user_id, reference, note, data_origin, supplier, unit_cost")
         .order("movement_id"),
     { pageSize, label: "stock_movements" }
   );
   progressDone(`stock_movements: ${fmtInt(existingMovements.length)}`);
 
   // Already applied? Then there is nothing to do, by definition.
-  const alreadyBackfilled = existingMovements.filter((m) => m.note === BACKFILL_NOTE).length;
+  const alreadyBackfilled = existingMovements.filter((m) => m.data_origin === BACKFILL_ORIGIN).length;
 
   // Rows this script wrote on an earlier run, by product.
   const backfilledByProduct = new Map();
   for (const m of existingMovements) {
-    if (m.note !== BACKFILL_NOTE) continue;
+    if (m.data_origin !== BACKFILL_ORIGIN) continue;
     backfilledByProduct.set(m.product_id, (backfilledByProduct.get(m.product_id) ?? 0) + 1);
   }
 
@@ -127,7 +130,7 @@ async function main() {
   // A product whose backfill died mid-way is the one case where its own
   // earlier rows must NOT be trusted: a half-written ledger would be planned
   // against the surviving fragment and come out wrong. Such a product is
-  // reset - its 'seed-backfill' rows are dropped and its history rebuilt from
+  // reset - its data_origin='seed' rows are dropped and its history rebuilt from
   // scratch. Detected below, after the uncovered sale lines are known: a
   // product with backfilled rows AND still-uncovered sales is incomplete.
   const covered = new Set();
@@ -138,7 +141,7 @@ async function main() {
     if (!match) continue;
     const key = `${match[2]}:${m.product_id}`;
     covered.add(key);
-    if (m.note === BACKFILL_NOTE) {
+    if (m.data_origin === BACKFILL_ORIGIN) {
       if (!coveredByBackfill.has(m.product_id)) coveredByBackfill.set(m.product_id, new Set());
       coveredByBackfill.get(m.product_id).add(key);
     }
@@ -218,7 +221,7 @@ async function main() {
     section("Nothing to do");
     console.log(
       `  Every confirmed sale line already has a stock_movements row.\n` +
-        `  ${fmtInt(alreadyBackfilled)} rows are tagged '${BACKFILL_NOTE}', so the backfill has run.\n` +
+        `  ${fmtInt(alreadyBackfilled)} rows carry data_origin='${BACKFILL_ORIGIN}', so the backfill has run.\n` +
         `  This script is idempotent: re-running it changes nothing.`
     );
     return;
@@ -230,7 +233,7 @@ async function main() {
     if (!slot) continue;
     // Rows from a half-finished run are being deleted, so they are not
     // fixed points in the timeline.
-    if (m.note === BACKFILL_NOTE && resetProducts.has(m.product_id)) continue;
+    if (m.data_origin === BACKFILL_ORIGIN && resetProducts.has(m.product_id)) continue;
     slot.events.push({
       kind: "existing",
       movement_id: m.movement_id,
@@ -313,7 +316,10 @@ async function main() {
         balance_after: row.balance_after,
         user_id: row.user_id ?? null,
         reference: row.reference ?? null,
-        note: BACKFILL_NOTE,
+        // The tag goes in data_origin; note stays empty, as it would for a
+        // row somebody entered and left no note on.
+        note: null,
+        data_origin: BACKFILL_ORIGIN,
         movement_ts: toManilaIso(row.ts),
         supplier: row.movement_type === "stock_in" ? (slot.product.supplier ?? null) : null,
         unit_cost: row.movement_type === "stock_in" ? (slot.product.unit_cost ?? null) : null,
@@ -374,7 +380,7 @@ async function main() {
       { k: "sales", v: `${fmtInt(sales.length)} (${fmtInt(voided)} voided, skipped)` },
       { k: "sale_items", v: fmtInt(saleItems.length) },
       { k: "stock_movements already present", v: fmtInt(existingMovements.length) },
-      { k: "  ...tagged seed-backfill", v: fmtInt(alreadyBackfilled) },
+      { k: "  ...tagged data_origin=seed", v: fmtInt(alreadyBackfilled) },
       { k: "sale lines already in the ledger (skipped)", v: fmtInt(skippedCovered) },
       { k: "sale lines on voided/missing sales (skipped)", v: fmtInt(skippedVoided) },
       { k: "sale lines for a missing product (skipped)", v: fmtInt(orphanItems) },
@@ -500,9 +506,9 @@ async function main() {
   if (resetProducts.size > 0) {
     section(`Products to reset after a half-finished run (${fmtInt(resetProducts.size)})`);
     console.log(
-      `  These have '${BACKFILL_NOTE}' rows AND sale lines with no movement, so an\n` +
-        `  earlier run died part-way. Their '${BACKFILL_NOTE}' rows are deleted and the\n` +
-        `  product is rebuilt whole. Nothing without that note is ever deleted.\n`
+      `  These have data_origin='${BACKFILL_ORIGIN}' rows AND sale lines with no movement,\n` +
+        `  so an earlier run died part-way. Those rows are deleted and the\n` +
+        `  product is rebuilt whole. Nothing without that tag is ever deleted.\n`
     );
     table(
       [...resetProducts].map((id) => ({
@@ -551,7 +557,7 @@ async function main() {
           .from("stock_movements")
           .delete({ count: "exact" })
           .eq("product_id", productId)
-          .eq("note", BACKFILL_NOTE);
+          .eq("data_origin", BACKFILL_ORIGIN);
         if (delError) throw new Error(delError.message);
         deletedRows += count ?? 0;
       }
@@ -582,7 +588,7 @@ async function main() {
       console.error(`  ${err.message}`);
       console.error(
         `  That product may be half-written. Re-run this script: it will detect the\n` +
-          `  partial state, delete only that product's '${BACKFILL_NOTE}' rows, and redo it.`
+          `  partial state, delete only that product's data_origin='${BACKFILL_ORIGIN}' rows, and redo it.`
       );
       throw err;
     }
@@ -590,7 +596,7 @@ async function main() {
   progressDone(`backfilled ${fmtInt(doneProducts)} products`);
 
   console.log(`  inserted ${fmtInt(insertedRows)} stock_movements rows`);
-  if (deletedRows > 0) console.log(`  deleted ${fmtInt(deletedRows)} stale '${BACKFILL_NOTE}' rows first`);
+  if (deletedRows > 0) console.log(`  deleted ${fmtInt(deletedRows)} stale data_origin='${BACKFILL_ORIGIN}' rows first`);
   console.log(`  updated balance_after on ${fmtInt(existingChanges.length)} existing row(s)`);
 
   const after = await countRows(sb, "stock_movements");

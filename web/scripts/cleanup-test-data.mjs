@@ -5,7 +5,7 @@
  *   node scripts/cleanup-test-data.mjs                 # dry run (default)
  *   node scripts/cleanup-test-data.mjs --apply         # refuses without the backup
  *
- * The seed and the simulation both tag their rows (note = 'seed-backfill' /
+ * The seed and the simulation both tag their rows (data_origin = 'seed' /
  * 'simulated'), so they can be removed with one delete each. The rows left
  * over from testing the app by hand carry no tag at all: they are ordinary
  * sales, movements and services, indistinguishable from real ones except by
@@ -63,13 +63,13 @@ const TODAY = manilaDateString(Date.now()).replace(/-/g, "");
 const BACKUP_PREFIX = `backup.cleanup_${TODAY}`;
 const BACKUP_DIR = resolve(WEB_DIR, "scripts", "backups");
 const IDS_FILE = resolve(WEB_DIR, "scripts", "simulated-ids.json");
-const SIMULATED_NOTE = "simulated";
+const SIMULATED_ORIGIN = "simulated";
 
 const cols = (...labels) => labels.map((label, i) => ({ label, get: (r) => r[i] }));
 const SKU_PATTERN = /^J1-\d{4}$/;
 
 // The seed's last sale is 30 Sep 2026 at 17:50 Manila (see the README). Every
-// sale after that is either tagged 'simulated' or was entered by hand through
+// sale after that is either tagged data_origin='simulated' or was entered by hand through
 // the app, which is what makes this a reliable discriminator and not just a
 // guess about trading hours: sale 156467 sits at 10:37, inside hours, and
 // out-of-hours alone would have missed it.
@@ -104,9 +104,9 @@ async function main() {
 
   progressLine("loading...");
   const [sales, items, movements, services, alerts, overrides, profiles] = await Promise.all([
-    pageAll(() => sb.from("sales").select("sale_id, sale_ts, status, note, total_amount, customer_name, customer_vehicle_brand, user_id").order("sale_id"), { pageSize, label: "sales" }),
+    pageAll(() => sb.from("sales").select("sale_id, sale_ts, status, note, data_origin, total_amount, customer_name, customer_vehicle_brand, user_id").order("sale_id"), { pageSize, label: "sales" }),
     pageAll(() => sb.from("sale_items").select("sale_item_id, sale_id, product_id, sku, quantity, line_revenue").order("sale_item_id"), { pageSize, label: "sale_items" }),
-    pageAll(() => sb.from("stock_movements").select("movement_id, product_id, sku, movement_ts, movement_type, quantity, balance_after, reference, note").order("movement_id"), { pageSize, label: "movements" }),
+    pageAll(() => sb.from("stock_movements").select("movement_id, product_id, sku, movement_ts, movement_type, quantity, balance_after, reference, note, data_origin").order("movement_id"), { pageSize, label: "movements" }),
     pageAll(() => sb.from("services").select("service_id, service_ts, service_type, status, total_amount, customer_vehicle_brand").order("service_id"), { pageSize, label: "services" }),
     testProductIdsEarly.length
       ? pageAll(() => sb.from("alerts").select("alert_id, product_id, sku, batch_id").in("product_id", testProductIdsEarly).order("alert_id"), { pageSize, label: "alerts" })
@@ -143,7 +143,7 @@ async function main() {
   // out-of-hours is recorded as a second reason where it applies, but it is
   // not the test, because one of these sales was entered at 10:37.
   const testSales = sales.filter(
-    (s) => s.note !== "simulated" && Date.parse(s.sale_ts) >= SEED_ENDS_AT
+    (s) => s.data_origin !== SIMULATED_ORIGIN && Date.parse(s.sale_ts) >= SEED_ENDS_AT
   );
   for (const s of testSales) {
     const ts = Date.parse(s.sale_ts);
@@ -176,13 +176,13 @@ async function main() {
     const ref = refIds(m.reference);
     if (ref != null && testSaleIds.has(ref)) return true;
     if (testProductIds.has(m.product_id)) return true;
-    return m.note == null && Date.parse(m.movement_ts) >= SEED_ENDS_AT;
+    return m.data_origin == null && Date.parse(m.movement_ts) >= SEED_ENDS_AT;
   });
   for (const m of testMovements) {
     const ref = refIds(m.reference);
     if (ref != null && testSaleIds.has(ref)) note(`stock_movements:${m.movement_id}`, `reference "${m.reference}" points at test sale ${ref}`);
     if (testProductIds.has(m.product_id)) note(`stock_movements:${m.movement_id}`, `belongs to test product ${m.sku}`);
-    if (m.note == null && Date.parse(m.movement_ts) >= SEED_ENDS_AT) {
+    if (m.data_origin == null && Date.parse(m.movement_ts) >= SEED_ENDS_AT) {
       const ts = Date.parse(m.movement_ts);
       note(
         `stock_movements:${m.movement_id}`,
@@ -242,7 +242,7 @@ async function main() {
     if (/test|asdf|qwer|dummy/i.test(s.customer_name ?? "")) {
       flagged.push(["sales", String(s.sale_id), `customer_name ${JSON.stringify(s.customer_name)} looks like a placeholder, but the row is in hours and tagged: LISTED ONLY`]);
     }
-    if (s.note && s.note !== "simulated" && s.note.length <= 3) {
+    if (s.note && s.note.length <= 3) {
       flagged.push(["sales", String(s.sale_id), `short note ${JSON.stringify(s.note)}: LISTED ONLY (in trading hours)`]);
     }
   }
@@ -343,7 +343,7 @@ async function main() {
         balance_after: walked.rows.find((r) => r.movement_id == null).balance_after,
         supplier: product.supplier ?? null,
         unit_cost: product.unit_cost ?? null,
-        note: SIMULATED_NOTE,
+        data_origin: SIMULATED_ORIGIN,
       });
       if (final.minBalance < 0) {
         conflicts.push({ sku: product.sku, minBalance: final.minBalance, note: "still negative after the fix" });
@@ -456,7 +456,7 @@ async function main() {
       cols("sku", "short by", "delivered", "when (Manila)", "placed", "balance after")
     );
     console.log("");
-    console.log("  One stock_in each, tagged 'simulated', with the product's own supplier");
+    console.log("  One stock_in each, tagged data_origin='simulated', with the product's own supplier");
     console.log("  and unit_cost, placed a minute before the row that would have gone");
     console.log("  negative. Sized by the simulation's own delivery rule for that product,");
     console.log("  not at the bare deficit, so it reads like the shop's other deliveries.");
@@ -793,7 +793,7 @@ async function applyCleanup(sb, ctx) {
         .from("stock_movements")
         .select("movement_id")
         .eq("product_id", pid)
-        .eq("note", SIMULATED_NOTE)
+        .eq("data_origin", SIMULATED_ORIGIN)
         .eq("movement_ts", fix.movement_ts);
       if (lookupError) throw new Error(`${p.sku}: checking for an existing restock failed: ${lookupError.message}`);
       if ((already ?? []).length === 0) {
@@ -809,7 +809,8 @@ async function applyCleanup(sb, ctx) {
               balance_after: fix.balance_after,
               user_id: null,
               reference: deliveryReceipt(fix.__ts),
-              note: SIMULATED_NOTE,
+              note: null,
+              data_origin: SIMULATED_ORIGIN,
               movement_ts: fix.movement_ts,
               supplier: fix.supplier,
               unit_cost: fix.unit_cost,
@@ -882,7 +883,7 @@ function appendRestockManifest(restockFixes) {
   }
   file.runs.push({
     generatedAt: new Date().toISOString(),
-    note: SIMULATED_NOTE,
+    dataOrigin: SIMULATED_ORIGIN,
     mode: "cleanup-restock",
     why: "one stock_in per product whose chain would have gone negative once the hand-entered test rows were removed",
     stockMovements: restockFixes.map((f) => ({

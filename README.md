@@ -294,6 +294,16 @@ Auth setting that goes with `030_fix_profiles_role_escalation.sql`.
 
 Confirm with `node scripts/check-staff-access.mjs --expect=after` once 034 is in.
 
+`035_hide_provenance_and_names.sql` goes **before** deploying the code that reads
+`profile_names()`, and is additive in the same sense: it adds a column and a
+function and changes one function's `order by`. It does rewrite table data - it
+moves the seed/simulated tags out of `note` into `data_origin` - so run the
+dry-run count at the top of the file first and check the figures it reports.
+`035_rollback.sql` puts the notes back from `data_origin` and drops the column.
+The seed scripts (`backfill-ledger.mjs`, `simulate-recent-activity.mjs`,
+`cleanup-test-data.mjs` and the verifiers) read `data_origin`, so they need 035
+applied before they will run.
+
 Multi-table writes (`confirm_sale`, `edit_sale`, `undo_sale`, `record_stock_movements`,
 `record_service`, `undo_service`) are Postgres RPC functions: `security definer`,
 row-locking and atomic, because PostgREST alone can't do a locking multi-statement
@@ -349,15 +359,25 @@ transaction in one call.
 The database is **not** real shop data. Two generators produced what is in it, and
 both tag their rows so they can be told apart from anything genuine.
 
+The tag lives in `data_origin` on `sales`, `services` and `stock_movements`:
+`'seed'`, `'simulated'`, or NULL for a row somebody entered. It used to sit in
+`note`, which the Sales screen, the edit-sale panel and both CSV exports all
+show - so a staff member reading a sale was being told "simulated" by a column
+meant for their own notes. Migration 035 moved it to its own column, which
+`authenticated` has no select grant on: only the service-role scripts read it.
+`note` is now only ever a note somebody typed.
+
 | Where it came from | Period | Tag |
 | --- | --- | --- |
-| Seed sales + the ledger backfill | 1 Jan 2020, 08:35 → 30 Sep 2026, 17:50 | `stock_movements.note = 'seed-backfill'` |
-| `simulate-recent-activity.mjs` | 8 Oct 2026 → the last run | `note = 'simulated'` on sales and movements; service id ranges in `web/scripts/simulated-ids.json` |
+| Seed sales + the ledger backfill | 1 Jan 2020, 08:35 → 30 Sep 2026, 17:50 | `stock_movements.data_origin = 'seed'` |
+| `simulate-recent-activity.mjs` | 8 Oct 2026 → the last run | `data_origin = 'simulated'` on sales, services and movements |
 | The same script in gap mode (`--from`/`--to`) | 1 to 6 Oct 2026 | the same tags. Added to fill the window between the seed's end and the simulated month, which read as a demand dip |
 | Hand-entered test rows | 30 Sep to 6 Oct 2026 | **removed on 3 Nov 2026**, see below |
 
 `web/scripts/simulated-ids.json` records every simulation run: the window it covered
 and the exact `sales` / `services` id ranges it inserted, plus a `howToRemove` list.
+The id ranges predate `data_origin` and are kept as a second record; either one
+identifies the same rows.
 
 ### The hand-entered test data has been removed
 
@@ -378,7 +398,7 @@ Removing them shifted 80 `balance_after` values and 8 `stock_on_hand` figures,
 because deleting a movement moves every later balance in that product's chain.
 Two products, J1-0044 and J1-0283, would have gone negative: the hand-entered
 stock-ins had supplied units that later simulated sales already consumed. Each
-got one `stock_in` tagged `'simulated'`, placed just before the row that would
+got one `stock_in` tagged `data_origin = 'simulated'`, placed just before the row that would
 have gone negative and sized by the simulation's own delivery rule (10 and 8
 units), with the product's own supplier and unit cost. Their ids are in
 `simulated-ids.json` under `mode: "cleanup-restock"`.
@@ -439,11 +459,12 @@ product's ledger on `products.stock_on_hand`; the simulation then moves that fig
 `simulated-ids.json` carries this list; in short:
 
 ```sql
-delete from stock_movements where note = 'simulated';
-delete from sale_items where sale_id in (select sale_id from sales where note = 'simulated');
-delete from sales where note = 'simulated';
--- services have no note column - use the id ranges from runs[] in simulated-ids.json
-delete from services where service_id between <first> and <last>;
+delete from stock_movements where data_origin = 'simulated';
+delete from sale_items where sale_id in (select sale_id from sales where data_origin = 'simulated');
+delete from sales where data_origin = 'simulated';
+delete from services where data_origin = 'simulated';
+-- or, equivalently, by the id ranges from runs[] in simulated-ids.json:
+-- delete from services where service_id between <first> and <last>;
 ```
 
 The hand-entered rows are already gone, with a backup kept locally, as described
@@ -451,7 +472,7 @@ above.
 
 Then restore `products.stock_on_hand` from the `backup` schema, or recompute it from
 the remaining ledger. Dropping the seed history as well means also deleting
-`note = 'seed-backfill'` movements and the sales behind them, at which point you are
+`data_origin = 'seed'` movements and the sales behind them, at which point you are
 starting from an empty catalog. That is the honest way to begin with real data.
 
 ---

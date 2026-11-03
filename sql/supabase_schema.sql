@@ -171,7 +171,15 @@ create table sales (
   customer_name     varchar(255),
   customer_contact  varchar(100),
   customer_address  varchar(255),
-  customer_vehicle_brand varchar(100)
+  customer_vehicle_brand varchar(100),
+  -- Where the row came from: 'seed', 'simulated', or null for a real
+  -- entry. `authenticated` has no select grant on it (see the column
+  -- privileges below) - the tag used to live in `note`, which every sales
+  -- screen and both CSV exports show. See
+  -- sql/migrations/035_hide_provenance_and_names.sql.
+  data_origin   text
+    constraint sales_data_origin_check
+    check (data_origin is null or data_origin in ('seed', 'simulated'))
 );
 create index ix_sales_ts on sales (sale_ts);
 
@@ -206,7 +214,15 @@ create table stock_movements (
   -- movement only (null for 'adjustment' and other types) - see
   -- sql/migrations/018_add_stockin_supplier_cost.sql for the full rationale.
   supplier      varchar(120),
-  unit_cost     numeric(12,2)
+  unit_cost     numeric(12,2),
+  -- Where the row came from: 'seed', 'simulated', or null for a real
+  -- entry. `authenticated` has no select grant on it (see the column
+  -- privileges below) - the tag used to live in `note`, which every sales
+  -- screen and both CSV exports show. See
+  -- sql/migrations/035_hide_provenance_and_names.sql.
+  data_origin   text
+    constraint stock_movements_data_origin_check
+    check (data_origin is null or data_origin in ('seed', 'simulated'))
 );
 create index ix_sm_ts on stock_movements (movement_ts);
 
@@ -225,7 +241,15 @@ create table services (
   customer_name     varchar(255),
   customer_contact  varchar(100),
   customer_address  varchar(255),
-  customer_vehicle_brand varchar(100)
+  customer_vehicle_brand varchar(100),
+  -- Where the row came from: 'seed', 'simulated', or null for a real
+  -- entry. `authenticated` has no select grant on it (see the column
+  -- privileges below) - the tag used to live in `note`, which every sales
+  -- screen and both CSV exports show. See
+  -- sql/migrations/035_hide_provenance_and_names.sql.
+  data_origin   text
+    constraint services_data_origin_check
+    check (data_origin is null or data_origin in ('seed', 'simulated'))
 );
 create index ix_services_ts on services (service_ts);
 
@@ -1650,13 +1674,48 @@ begin
     where m.movement_type = 'stock_in'
       and m.movement_ts >= p_start
       and m.movement_ts <  p_end
-    order by m.movement_id desc;
+    -- by time, not by id: the October gap fill inserted the highest ids
+    -- with the earliest timestamps, so "newest id" stopped meaning
+    -- "most recent". movement_id is the tie-break only.
+    order by m.movement_ts desc, m.movement_id desc;
 end;
 $$;
 
 revoke execute on function owner_stockin_log(timestamptz, timestamptz) from public;
 revoke execute on function owner_stockin_log(timestamptz, timestamptz) from anon;
 grant execute on function owner_stockin_log(timestamptz, timestamptz) to authenticated, service_role;
+
+
+-- ---------------------------------------------------------------------
+--  profile_names() - who recorded a sale, without widening profiles.
+--
+--  profiles_select lets a user read their own row, or every row if they
+--  are the owner. That is right for a table holding usernames (which are
+--  email addresses), roles and is_active - and it means every sale
+--  recorded by somebody else showed "Former staff" to a staff user,
+--  because the embedded profiles(full_name) came back empty.
+--
+--  So: a definer function returning ONLY the id and the display name.
+--  The profiles policy is untouched. No role check inside, deliberately -
+--  staff are meant to see these names; anon is revoked, so the caller has
+--  to be signed in.
+--
+--  See sql/migrations/035_hide_provenance_and_names.sql.
+-- ---------------------------------------------------------------------
+
+create or replace function profile_names()
+returns table(id uuid, full_name text)
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select p.id, p.full_name::text from profiles p;
+$$;
+
+revoke execute on function profile_names() from public;
+revoke execute on function profile_names() from anon;
+grant execute on function profile_names() to authenticated, service_role;
 
 
 -- 7. One SKU's whole supplier history, aggregated.
@@ -1741,6 +1800,16 @@ grant select (
   movement_id, movement_ts, product_id, sku, movement_type, quantity,
   balance_after, user_id, reference, note, supplier
 ) on stock_movements to authenticated;
+
+-- data_origin on the three tables is not a cost column, but it is the same
+-- shape of problem: a thing the screens were never meant to say. The lists
+-- above already omit it for sales and stock_movements; services has no
+-- column grants of its own, so its revoke is explicit. Only the
+-- service-role seed scripts read it. See
+-- sql/migrations/035_hide_provenance_and_names.sql.
+revoke select (data_origin) on sales           from authenticated;
+revoke select (data_origin) on services        from authenticated;
+revoke select (data_origin) on stock_movements from authenticated;
 
 -- vw_product_velocity carries gross_profit_90d, so the whole view is
 -- owner-only through owner_product_performance() instead.

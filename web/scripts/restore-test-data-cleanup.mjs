@@ -152,7 +152,7 @@ async function main(path) {
       .select("movement_id, quantity, balance_after")
       .eq("product_id", row.product_id)
       .eq("movement_ts", row.movement_ts)
-      .eq("note", "simulated");
+      .eq("data_origin", "simulated");
     if (error) throw new Error(`restock lookup: ${error.message}`);
     for (const m of data ?? []) toDelete.push({ ...m, sku: row.sku, movement_ts: row.movement_ts });
   }

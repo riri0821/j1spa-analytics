@@ -324,9 +324,9 @@ is("ceiling tolerates a missing reorder_point", stockCeiling({}, 0), 10);
 // ------------------------------------------- partial-failure recovery
 
 // backfill-ledger treats a product's backfill as half-finished when it has
-// 'seed-backfill' rows AND sale lines that still have no movement. These
+// data_origin='seed' rows AND sale lines that still have no movement. These
 // check that rule - it is what makes --apply safe to re-run - and that only
-// 'seed-backfill' rows are ever in scope for deletion.
+// data_origin='seed' rows are ever in scope for deletion.
 function classify({ backfilledRows, uncoveredSales }) {
   if (backfilledRows === 0) return uncoveredSales > 0 ? "insert" : "nothing-to-do";
   return uncoveredSales > 0 ? "reset-and-redo" : "complete";
@@ -377,14 +377,14 @@ is("nothing at all -> nothing to do", classify({ backfilledRows: 0, uncoveredSal
 {
   // Deletion scope: only rows carrying the backfill note may be removed.
   const rows = [
-    { movement_id: 1, note: "seed-backfill" },
+    { movement_id: 1, data_origin: "seed" },
     { movement_id: 2, note: null },
-    { movement_id: 3, note: "simulated" },
+    { movement_id: 3, data_origin: "simulated" },
     { movement_id: 4, note: "opening stock" },
-    { movement_id: 5, note: "seed-backfill" },
+    { movement_id: 5, data_origin: "seed" },
   ];
-  const deletable = rows.filter((r) => r.note === "seed-backfill").map((r) => r.movement_id);
-  is("only seed-backfill rows are deletable", deletable, [1, 5]);
+  const deletable = rows.filter((r) => r.data_origin === "seed").map((r) => r.movement_id);
+  is("only data_origin='seed' rows are deletable", deletable, [1, 5]);
   ok("a real movement is never deletable", !deletable.includes(2) && !deletable.includes(3) && !deletable.includes(4));
 }
 
