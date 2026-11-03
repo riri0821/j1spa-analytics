@@ -1,13 +1,17 @@
 /**
  * Rule-based decision support (paper 3.6), ported from app/rules/engine.py.
  * Deterministic conditions evaluated against current stock balances.
- * Advisory only - writes to `alerts`, never changes stock/orders itself.
+ * Advisory only - never changes stock/orders itself. It records its result
+ * into `alerts`, but only when the advice differs from the last batch
+ * recorded (see lib/alertsBatch.js); re-recording an identical set on every
+ * page load is what grew that table to ~149,000 near-identical rows.
  *
  * Only needs a 3-month moving average (not ARIMA/Holt-Winters), so this
  * stays in Next.js/Postgres rather than calling the Python forecast
  * service - no heavy stats library needed for this one.
  */
 import { fetchAllRows } from "./analytics";
+import { ALERT_INSERT_CHUNK, advisoryFingerprint, chunkRows } from "./alertsBatch";
 
 const LEAD_TIME_DAYS = 30; // config.SUPPLIER_LEAD_TIME_DAYS
 const SPIKE_THRESHOLD_PCT = 30.0; // config.SPIKE_THRESHOLD_PCT
@@ -154,6 +158,45 @@ function buildTypeAdvisory(type, p, ctx, isManualType) {
   );
 }
 
+/**
+ * The most recent recorded batch, as { batchId, generatedAt, rows }, or null
+ * if `alerts` is empty. Two queries rather than one group-by: the newest row
+ * names the newest batch (ix_alert_gen makes that a cheap lookup even at
+ * 149k rows), then that batch's own rows are read.
+ *
+ * generated_ts defaults to now() per INSERT statement, so a chunked batch
+ * carries a few values microseconds apart; the newest of them still belongs
+ * to the newest batch, which is all this needs to identify it.
+ */
+async function loadLatestBatch(supabase) {
+  const { data: newest, error } = await supabase
+    .from("alerts")
+    .select("batch_id, generated_ts")
+    .order("generated_ts", { ascending: false })
+    .order("alert_id", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    // Treated as "no previous batch", which records this run. Recording a
+    // duplicate is the safe way to be wrong here - the alternative is
+    // silently dropping a real change in the advice.
+    console.error("evaluateDecisionSupport: could not read the last alert batch - recording this run:", error.message);
+    return null;
+  }
+  if (!newest) return null;
+
+  const rows = await fetchAllRows(() =>
+    supabase
+      .from("alerts")
+      .select("product_id, alert_type, severity")
+      .eq("batch_id", newest.batch_id)
+      .order("alert_id")
+  );
+
+  return { batchId: newest.batch_id, generatedAt: newest.generated_ts, rows };
+}
+
 export async function evaluateDecisionSupport(supabase) {
   const [velocityRows, products, { data: monthlyRows }, { data: overrideRows }] = await Promise.all([
     // Both paged: a plain select stops at PostgREST's 1000-row default, which
@@ -250,9 +293,22 @@ export async function evaluateDecisionSupport(supabase) {
     advisories.push(adv);
   }
 
-  const batchId = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
+  // One clock read for both, so the batch id and the timestamp reported for
+  // it cannot land on either side of a second boundary.
+  const generatedAt = new Date().toISOString();
+  const batchId = generatedAt.replace(/\D/g, "").slice(0, 14);
 
-  if (advisories.length > 0) {
+  const previous = await loadLatestBatch(supabase);
+  // Only the advice itself counts as a change - see lib/alertsBatch.js.
+  const unchanged = previous !== null && advisoryFingerprint(previous.rows) === advisoryFingerprint(advisories);
+
+  let recorded = false;
+  // The batch that now matches what is on screen. Null when nothing matches
+  // it: either `alerts` is empty, or the set has gone empty and this schema
+  // has no way to record a batch of no rows.
+  let lastChangedAt = unchanged ? previous.generatedAt : null;
+
+  if (!unchanged && advisories.length > 0) {
     const rows = advisories.map((a) => ({
       batch_id: batchId,
       product_id: a.productId,
@@ -270,7 +326,19 @@ export async function evaluateDecisionSupport(supabase) {
         a.rules.map((r) => `${r.id} ${r.expr} -> ${r.result ? "TRUE" : "FALSE"}`).join("; ")
       ).slice(0, 255),
     }));
-    await supabase.from("alerts").insert(rows);
+
+    for (const chunk of chunkRows(rows, ALERT_INSERT_CHUNK)) {
+      const { error } = await supabase.from("alerts").insert(chunk);
+      if (error) {
+        // A half-written batch does not match the current set, so the next
+        // run compares against it, sees a difference and records again -
+        // wasteful but self-correcting, and never a silent loss.
+        console.error("evaluateDecisionSupport: alert batch insert failed:", error.message);
+        break;
+      }
+      recorded = true;
+    }
+    if (recorded) lastChangedAt = generatedAt;
   }
 
   // Each product yields at most one advisory (one finalType, or none), so
@@ -298,7 +366,11 @@ export async function evaluateDecisionSupport(supabase) {
 
   return {
     batchId,
-    generatedAt: new Date().toISOString(),
+    generatedAt,
+    // Whether this run wrote a new batch, and when the advice last actually
+    // changed - the Decision Support page shows the latter.
+    recorded,
+    lastChangedAt,
     count: advisories.length,
     byType,
     unitsByType,

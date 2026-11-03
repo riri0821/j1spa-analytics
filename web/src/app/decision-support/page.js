@@ -6,6 +6,19 @@ import Sidebar from "../dashboard/Sidebar";
 import RefreshButton from "../dashboard/RefreshButton";
 import AdvisoryList from "./AdvisoryList";
 
+// Manila, not the server's zone (UTC on Vercel), the same way the
+// dashboard's own date line is pinned.
+function manilaDateTime(ts) {
+  return new Date(ts).toLocaleString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: "Asia/Manila",
+  });
+}
+
 export default async function DecisionSupportPage() {
   const supabase = await createClient();
   const {
@@ -33,8 +46,17 @@ export default async function DecisionSupportPage() {
               Advisory only - the system makes no automatic reorder or pricing changes.
             </p>
           </div>
-          <div className="mt-10">
+          <div className="mt-10 flex flex-col items-end gap-1.5">
             <RefreshButton />
+            {/* A run only records a batch when the advice itself changes, so
+                this is the age of the advice, not of the page. Absent while
+                nothing is recorded - an empty advisory set cannot be stored
+                as a batch of no rows. */}
+            {result.lastChangedAt && (
+              <p className="text-xs whitespace-nowrap" style={{ color: theme.textMuted }}>
+                Advisories last changed: {manilaDateTime(result.lastChangedAt)}
+              </p>
+            )}
           </div>
         </div>
 
