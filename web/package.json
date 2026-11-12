@@ -10,7 +10,8 @@
     "check:ledger": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/ledger.check.mjs",
     "check:alerts": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/alertsBatch.check.mjs",
     "check:gross-net": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/grossNetRange.check.mjs",
-    "check:backfill": "node scripts/backfillPlan.check.mjs"
+    "check:backfill": "node scripts/backfillPlan.check.mjs",
+    "check:advisory": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/decisionSupport.check.mjs"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.7",

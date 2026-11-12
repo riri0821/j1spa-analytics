@@ -16,6 +16,12 @@ import { ALERT_INSERT_CHUNK, advisoryFingerprint, chunkRows } from "./alertsBatc
 const LEAD_TIME_DAYS = 30; // config.SUPPLIER_LEAD_TIME_DAYS
 const SPIKE_THRESHOLD_PCT = 30.0; // config.SPIKE_THRESHOLD_PCT
 const OVERSTOCK_DOS_DAYS = 90; // config.OVERSTOCK_DOS_DAYS
+// A spike is only worth flagging if the volume behind it is. On this
+// catalog most items sell 2-3 units a month, where one extra unit clears
+// the 30% deviation on its own - 153 of 576 products flagged, nearly all
+// of them noise at that volume. R-06 requires the forecast itself to be
+// at least this many units before a deviation counts as a spike.
+const MIN_SPIKE_UNITS = 5;
 
 function round(n, d = 2) {
   const f = 10 ** d;
@@ -100,7 +106,7 @@ function makeAdvisory(product, type, severity, title, message, recommendation, f
 // same message/rule-trace shape as a rule-triggered one, just built for
 // a type the rules themselves may not have picked.
 function buildTypeAdvisory(type, p, ctx, isManualType) {
-  const { fc30, avg12, dtd, dev, dos, r01, r02, r03, r04, r05, r07, r08, r09 } = ctx;
+  const { fc30, avg12, dtd, dev, dos, r01, r02, r03, r04, r05, r06, r07, r08, r09 } = ctx;
 
   if (type === "low_stock") {
     return makeAdvisory(
@@ -134,6 +140,7 @@ function buildTypeAdvisory(type, p, ctx, isManualType) {
       [
         ["R-04", `forecast_30d (${Math.round(fc30)}) > avg_12w (${Math.round(avg12)})`, r04],
         ["R-05", `deviation_pct (${dev.toFixed(1)}%) > threshold (${SPIKE_THRESHOLD_PCT.toFixed(0)}%)`, r05],
+        ["R-06", `forecast_30d (${Math.round(fc30)}) ≥ min_spike_units (${MIN_SPIKE_UNITS})`, r06],
       ],
       isManualType
     );
@@ -279,11 +286,12 @@ export async function evaluateDecisionSupport(supabase) {
     const r03 = dtd < LEAD_TIME_DAYS;
     const r04 = fc30 > avg12 && avg12 > 0;
     const r05 = dev > SPIKE_THRESHOLD_PCT;
+    const r06 = fc30 >= MIN_SPIKE_UNITS;
     const r07 = p.reorder_point > 0 && p.stock_on_hand > p.reorder_point * 3;
     const r08 = velocity === "Slow-Moving";
     const r09 = dos > OVERSTOCK_DOS_DAYS;
 
-    const naturalType = r01 ? "low_stock" : r04 && r05 ? "demand_spike" : r07 && (r08 || r09) ? "overstock" : null;
+    const naturalType = r01 ? "low_stock" : r04 && r05 && r06 ? "demand_spike" : r07 && (r08 || r09) ? "overstock" : null;
     const manualType = manualTypeMap.get(p.product_id) ?? null;
     const finalType = manualType || naturalType;
     if (!finalType) continue;
@@ -291,7 +299,7 @@ export async function evaluateDecisionSupport(supabase) {
     const adv = buildTypeAdvisory(
       finalType,
       p,
-      { fc30, avg12, dtd, dev, dos, r01, r02, r03, r04, r05, r07, r08, r09 },
+      { fc30, avg12, dtd, dev, dos, r01, r02, r03, r04, r05, r06, r07, r08, r09 },
       !!manualType
     );
     // What the rule engine would show with no override - lets the edit UI
