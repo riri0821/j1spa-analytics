@@ -53,3 +53,27 @@ export function orIlikeFilter(fields, term) {
   const quoted = escapeLikeTerm(trimmed).replace(/[\\"]/g, (c) => `\\${c}`);
   return fields.map((f) => `${f}.ilike."%${quoted}%"`).join(",");
 }
+
+/**
+ * The in-memory counterpart to `orIlikeFilter`, for a screen that already
+ * holds the rows it is searching. Forecasting loads the whole active catalog
+ * server-side for its category select, so a query per keystroke would be a
+ * round trip for an answer the page has in hand.
+ *
+ * The semantics are the filter's: `%term%` matched case-insensitively
+ * against each of `fields`, so a row this keeps is a row that filter would
+ * have returned. An empty term matches everything, mirroring the `""` that
+ * `orIlikeFilter` returns for callers to skip.
+ *
+ * Deliberately no escaping. Nothing downstream parses this term - there is
+ * no LIKE pattern and no filter string - so `%` and `_` are already literal,
+ * and `*` is too, which the PostgREST path cannot manage. Running
+ * `escapeLikeTerm` over it here would be the bug that function prevents
+ * elsewhere: it would turn a typed `%` into `\%` and make an item whose name
+ * genuinely contains one unfindable.
+ */
+export function matchesIlikeTerm(fields, term, row) {
+  const needle = String(term ?? "").trim().toLowerCase();
+  if (!needle) return true;
+  return fields.some((f) => String(row?.[f] ?? "").toLowerCase().includes(needle));
+}

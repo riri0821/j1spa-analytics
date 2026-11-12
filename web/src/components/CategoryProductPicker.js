@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { createClient } from "@/lib/supabase/client";
 import { theme } from "@/app/dashboard/theme";
-import { orIlikeFilter } from "@/lib/searchFilter";
+import { matchesIlikeTerm, orIlikeFilter } from "@/lib/searchFilter";
 
 // Shared "pick a category, then the item" product picker, used by Sales
 // Entry, the Edit Sale panel, Stock In and (as the select-pair variant
@@ -20,6 +20,10 @@ import { orIlikeFilter } from "@/lib/searchFilter";
 const PAGE_SIZE = 1000; // PostgREST's per-request ceiling
 
 const ALL = "__all__";
+
+// The fields both pickers search on, named once so the table variant and
+// the select pair cannot drift apart.
+const SKU_SEARCH_FIELDS = ["name", "sku"];
 
 const inputClass = "rounded border px-3 py-1.5 text-sm";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
@@ -137,7 +141,7 @@ export function CategorySelect({ value, onChange, categories, total, className =
 
 export default function CategoryProductPicker({
   columns,
-  searchFields = ["name", "sku"],
+  searchFields = SKU_SEARCH_FIELDS,
   searchPlaceholder = "Search name, SKU...",
   tableHead,
   columnCount,
@@ -300,8 +304,25 @@ export default function CategoryProductPicker({
 /** Category -> SKU select pair, for Forecasting, where the picker has to
  *  yield a single SKU rather than a list with row actions. Works off a
  *  products array the caller already has, so it shares this module's
- *  grouping and labelling without a second round trip. */
-export function CategorySkuSelect({ products, value, onChange, disabled = false }) {
+ *  grouping and labelling without a second round trip.
+ *
+ *  `searchable` adds a SKU/name box that narrows the item select the way the
+ *  table picker's Search box narrows its rows. It filters the same array in
+ *  memory via matchesIlikeTerm - the in-memory half of lib/searchFilter.js,
+ *  same fields and same case-insensitive `%term%` semantics as the `or=`
+ *  filter the table picker sends - because the caller has already loaded
+ *  every active product and a query per keystroke would fetch what it holds.
+ *  Filtering as you type, with no Search button, is why: the table picker
+ *  waits for a submit precisely because each search costs a round trip. */
+export function CategorySkuSelect({
+  products,
+  value,
+  onChange,
+  disabled = false,
+  searchable = false,
+  searchFields = SKU_SEARCH_FIELDS,
+  searchPlaceholder = "Search SKU or item name",
+}) {
   const categories = useMemo(() => categoriesFrom(products), [products]);
 
   // Seeded from the incoming SKU so /forecasting?sku=X lands with X's
@@ -311,37 +332,79 @@ export function CategorySkuSelect({ products, value, onChange, disabled = false 
     const found = products.find((p) => p.sku === value);
     return found ? nameOf(found) : "";
   });
+  const [term, setTerm] = useState("");
+
+  const searching = searchable && term.trim() !== "";
 
   const visible = useMemo(() => {
     const inCategory = category ? products.filter((p) => nameOf(p) === category) : products;
-    return [...inCategory].sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
-  }, [products, category]);
+    const found = searching ? inCategory.filter((p) => matchesIlikeTerm(searchFields, term, p)) : inCategory;
+    return [...found].sort((a, b) => (a.name ?? "").localeCompare(b.name ?? ""));
+    // searchFields is a literal array at every call site, so it is stable in
+    // practice; listing it would rebuild this on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [products, category, searching, term]);
+
+  // One rule for both filters: a selection the narrowed list no longer
+  // contains is dropped, so the item select can never show a value that is
+  // missing from its own options. Done in the handlers rather than in a
+  // memo, which is where the category half has always done it.
+  function stillListed(inCategory, nextTerm) {
+    return products.some(
+      (p) =>
+        p.sku === value &&
+        (!inCategory || nameOf(p) === inCategory) &&
+        (!searchable || matchesIlikeTerm(searchFields, nextTerm, p))
+    );
+  }
 
   function changeCategory(next) {
     setCategory(next);
-    // Drop a selection that the new category doesn't contain, so the two
-    // selects can never disagree.
-    if (value && next && !products.some((p) => p.sku === value && nameOf(p) === next)) onChange("");
+    if (value && !stillListed(next, term)) onChange("");
   }
 
+  function changeTerm(next) {
+    setTerm(next);
+    if (value && !stillListed(category, next)) onChange("");
+  }
+
+  // "No items match" only once a search has actually excluded everything -
+  // an empty category still reads as "Select an item (0)", as it did before.
+  const placeholder = searching && visible.length === 0
+    ? "No items match"
+    : category || searching
+      ? `Select an item (${visible.length})`
+      : "Select an item...";
+
   return (
-    <div className="flex flex-wrap gap-2">
+    <div className="flex w-full flex-wrap gap-2 sm:w-auto">
       <CategorySelect
         value={category}
         onChange={changeCategory}
         categories={categories}
         total={products.length}
-        className="w-48"
+        className="w-full sm:w-48"
       />
+      {searchable && (
+        <input
+          type="search"
+          value={term}
+          onChange={(e) => changeTerm(e.target.value)}
+          placeholder={searchPlaceholder}
+          aria-label={searchPlaceholder}
+          className={`w-full sm:w-56 ${inputClass}`}
+          style={inputStyle}
+        />
+      )}
       <select
         value={value || ""}
         onChange={(e) => onChange(e.target.value)}
         disabled={disabled}
-        className={`w-72 ${inputClass}`}
+        className={`w-full sm:w-72 ${inputClass}`}
         style={inputStyle}
         aria-label="Product"
       >
-        <option value="">{category ? `Select an item (${visible.length})` : "Select an item..."}</option>
+        <option value="">{placeholder}</option>
         {visible.map((p) => (
           <option key={p.sku} value={p.sku}>
             {p.sku} — {p.name}

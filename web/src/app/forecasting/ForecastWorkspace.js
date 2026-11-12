@@ -136,7 +136,7 @@ export default function ForecastWorkspace({ products, initialSku = "" }) {
         className="flex flex-wrap items-center gap-3 rounded-lg border p-4"
         style={{ backgroundColor: theme.cardBg, borderColor: theme.border }}
       >
-        <CategorySkuSelect products={products} value={sku} onChange={setSku} />
+        <CategorySkuSelect products={products} value={sku} onChange={setSku} searchable />
 
         <select
           value={horizon}
