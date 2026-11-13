@@ -11,6 +11,19 @@ import { CategorySelect, fetchCategoryCounts } from "@/components/CategoryProduc
 const inputClass = "rounded border px-2 py-1.5 text-sm w-full";
 const inputStyle = { backgroundColor: theme.cardBgAlt, borderColor: theme.border, color: theme.textPrimary };
 
+// owner_product_catalog's own ceiling: it ends in
+//   limit greatest(1, least(coalesce(p_limit, 500), 2000))
+// so 2000 is the most it will ever hand back, whatever is asked for. This
+// used to ask for 500, which silently cut a 576-product catalog down to 500
+// and had the pagination report "1-10 of 500" over 50 pages - the count
+// comes from the rows that arrived, so the screen had no way to know the
+// other 76 existed. Asking for the ceiling is what makes the count true.
+//
+// Past 2000 products this needs an offset parameter on the function rather
+// than a bigger number here, which is why reaching it is reported rather
+// than rounded off - see `truncated` below.
+const CATALOG_LIMIT = 2000;
+
 const emptyForm = {
   product_id: null,
   sku: "",
@@ -30,13 +43,17 @@ export default function ProductsScreen() {
   const [categories, setCategories] = useState([]);
   const [search, setSearch] = useState("");
   // Filter is applied server-side, so picking a category shows all of it
-  // rather than whichever of its items happened to fall inside the 500-row
-  // page the unfiltered query returns.
+  // rather than whichever of its items happened to fall inside the page the
+  // unfiltered query returns.
   const [categoryFilter, setCategoryFilter] = useState("");
   const [categoryCounts, setCategoryCounts] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  // Set only if a read came back exactly at CATALOG_LIMIT, i.e. the catalog
+  // has outgrown what one call can return. Loud, because the symptom of the
+  // bug this replaces was a total that looked perfectly plausible.
+  const [truncated, setTruncated] = useState(false);
   const [form, setForm] = useState(null); // null = form closed
 
   const loadProducts = useCallback(
@@ -50,10 +67,15 @@ export default function ProductsScreen() {
       const { data, error: fetchError } = await supabase.rpc("owner_product_catalog", {
         p_search: term ?? null,
         p_category: category || null,
-        p_limit: 500,
+        p_limit: CATALOG_LIMIT,
       });
-      if (fetchError) setError(fetchError.message);
-      else setProducts(data ?? []);
+      if (fetchError) {
+        setError(fetchError.message);
+      } else {
+        const rows = data ?? [];
+        setProducts(rows);
+        setTruncated(rows.length >= CATALOG_LIMIT);
+      }
       setLoading(false);
     },
     [supabase]
@@ -209,6 +231,12 @@ export default function ProductsScreen() {
 
       {error && <p className="text-sm text-red-400">{error}</p>}
       {notice && <p className="text-sm text-green-400">{notice}</p>}
+      {truncated && (
+        <p className="text-sm text-amber-400">
+          Showing the first {CATALOG_LIMIT} products only - the catalog is larger than one request can return, so the
+          count above is not the whole list. Narrow it with a category or a search.
+        </p>
+      )}
 
       {form && (
         <ProductForm
