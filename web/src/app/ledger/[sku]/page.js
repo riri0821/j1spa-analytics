@@ -114,29 +114,42 @@ export default async function LedgerPage({ params, searchParams }) {
 
   return (
     <Shell fullName={profile.full_name} role={profile.role}>
-      <div className="mb-6 flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <a href="/dashboard" className="text-xs" style={{ color: CATEGORICAL[0] }}>
-            ← Back to dashboard
-          </a>
-          <h1 className="mt-1 text-xl font-semibold" style={{ color: theme.textPrimary }}>
-            Stock Ledger · <span className="font-mono">{product.sku}</span>
-          </h1>
-          <p className="text-sm" style={{ color: theme.textMuted }}>
-            {product.name}
-          </p>
-        </div>
-        <a
-          href={forecastHref}
-          className="rounded px-4 py-1.5 text-sm font-medium"
-          style={{ backgroundColor: theme.accent, color: "#05230f" }}
-        >
-          View demand forecast
+      {/* No right-hand content on this row. Topbar is `fixed right-3 top-3
+          z-50`, so at md+ (where main's content starts at its p-8 padding,
+          above the bar's lower edge) anything right-aligned here is covered
+          by the account menu - which is what hid all but a strip of the
+          forecast button. The other screens with header controls offset
+          them with mt-10 for the same reason (sales, decision-support);
+          here the button moved into the Item details header below, which is
+          clear of the bar at every width and already has a slot for it. */}
+      <div className="mb-6">
+        <a href="/dashboard" className="text-xs" style={{ color: CATEGORICAL[0] }}>
+          ← Back to dashboard
         </a>
+        <h1 className="mt-1 text-xl font-semibold" style={{ color: theme.textPrimary }}>
+          Stock Ledger · <span className="font-mono">{product.sku}</span>
+        </h1>
+        <p className="text-sm" style={{ color: theme.textMuted }}>
+          {product.name}
+        </p>
       </div>
 
       <div className="mb-4">
-        <Card title="Item details">
+        <Card
+          title="Item details"
+          // Card's header is flex-wrap with min-w-0 actions, so on a narrow
+          // screen this drops to its own line under the title instead of
+          // widening the card.
+          actions={
+            <a
+              href={forecastHref}
+              className="inline-block rounded px-4 py-1.5 text-sm font-medium whitespace-nowrap"
+              style={{ backgroundColor: theme.accent, color: "#05230f" }}
+            >
+              View demand forecast
+            </a>
+          }
+        >
           <dl className="grid gap-4 text-sm sm:grid-cols-3 lg:grid-cols-6">
             <Detail label="Category" value={product.category} />
             <Detail label="Brand" value={product.brand} />
