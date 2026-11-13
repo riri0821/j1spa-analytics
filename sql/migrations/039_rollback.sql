@@ -109,6 +109,10 @@ group by supplier
 order by supplier;
 
 -- The backup tables are left in place on purpose, so a rollback can be
--- re-run or re-checked. Drop them only when you are done with 039:
+-- re-run or re-checked. Drop them only when you are done with 039 - and the
+-- category map with them, which 039 also leaves behind (it is a plain table
+-- in the backup schema, not a temp table, because the SQL editor does not
+-- keep a temp table between statements):
 --   drop table backup.supplier_20261113_products;
 --   drop table backup.supplier_20261113_stock_movements;
+--   drop table backup.supplier_map_20261113;

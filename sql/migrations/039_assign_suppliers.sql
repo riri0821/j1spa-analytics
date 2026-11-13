@@ -100,15 +100,24 @@ end $$;
 
 -- -------------------------------------------------------- 2. the mapping
 --
--- One row per category, in a temp table so the two updates and the guards
--- all read the same single source of truth. It disappears when the session
--- ends; nothing permanent is created.
-create temporary table supplier_map (
+-- One row per category, so the two updates and the guards all read the same
+-- single source of truth.
+--
+-- A plain table in the backup schema rather than a temp table: the Supabase
+-- SQL editor does not keep a temp table between statements, which made the
+-- first run fail with 'relation "supplier_map" does not exist' (nothing was
+-- written). The backup schema is not exposed by PostgREST.
+--
+-- So this one DOES outlive the run, unlike the temp table it replaces. It is
+-- left in place on purpose - the rollback does not need it, but it is the
+-- record of which supplier each category was assigned to. 039_rollback.sql
+-- lists it with the backup tables to drop when you are finished with 039.
+create table if not exists backup.supplier_map_20261113 (
   category text primary key,
   supplier text not null
-) on commit drop;
+);
 
-insert into supplier_map (category, supplier) values
+insert into backup.supplier_map_20261113 (category, supplier) values
   -- Supplier 1 - transmission
   ('CVT & Clutch Parts', 'Supplier 1'),
   ('Bearings',           'Supplier 1'),
@@ -126,7 +135,8 @@ insert into supplier_map (category, supplier) values
   ('Brakes',             'Supplier 3'),
   ('Tires',              'Supplier 3'),
   ('Suspension',         'Supplier 3'),
-  ('Accessories',        'Supplier 3');
+  ('Accessories',        'Supplier 3')
+on conflict (category) do update set supplier = excluded.supplier;
 
 -- Every product must map to a supplier. A category added since this was
 -- written would otherwise silently keep 'Unknown'.
@@ -138,7 +148,7 @@ begin
   select string_agg(distinct p.category, ', ' order by p.category)
     into v_unmapped
     from products p
-    left join supplier_map m on m.category = p.category
+    left join backup.supplier_map_20261113 m on m.category = p.category
    where m.category is null;
 
   if v_unmapped is not null then
@@ -151,7 +161,7 @@ begin
   -- matches no product assigns nothing.
   select string_agg(m.category, ', ' order by m.category)
     into v_unused
-    from supplier_map m
+    from backup.supplier_map_20261113 m
     left join products p on p.category = m.category
    where p.category is null;
 
@@ -165,7 +175,7 @@ end $$;
 -- `supplier` is the only column in the SET list.
 update products p
    set supplier = m.supplier
-  from supplier_map m
+  from backup.supplier_map_20261113 m
  where m.category = p.category
    and p.supplier is distinct from m.supplier;
 
