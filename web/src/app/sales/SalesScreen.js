@@ -24,7 +24,10 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
   // from the current Manila day.
   const isOwner = role === "owner";
 
-  const [tab, setTab] = useState(initialTab); // "entry" | "services" | "tracker"
+  // "entry" | "services" | "tracker". The tracker is owner-only: page.js
+  // redirects a staff session away from ?tab=tracker, and this keeps such a
+  // session on Sales Entry even if that value ever reaches here.
+  const [tab, setTab] = useState(initialTab === "tracker" && !isOwner ? "entry" : initialTab);
   // Bumped after a sale so both pickers re-read stock_on_hand.
   const [catalogVersion, setCatalogVersion] = useState(0);
   const [cart, setCart] = useState([]); // [{product_id, sku, name, unit_price, stock_on_hand, qty}]
@@ -329,16 +332,20 @@ export default function SalesScreen({ userId, role, initialTab = "entry" }) {
         >
           Services
         </button>
-        <button
-          onClick={() => setTab("tracker")}
-          className="rounded px-3 py-1.5 text-sm font-medium"
-          style={tab === "tracker" ? { backgroundColor: theme.accent, color: "#05230f" } : { color: theme.textSecondary }}
-        >
-          Sales Tracker
-        </button>
+        {isOwner && (
+          <button
+            onClick={() => setTab("tracker")}
+            className="rounded px-3 py-1.5 text-sm font-medium"
+            style={
+              tab === "tracker" ? { backgroundColor: theme.accent, color: "#05230f" } : { color: theme.textSecondary }
+            }
+          >
+            Sales Tracker
+          </button>
+        )}
       </div>
 
-      {tab === "tracker" && <SalesTracker role={role} />}
+      {isOwner && tab === "tracker" && <SalesTracker />}
       {tab === "services" && <ServicesScreen userId={userId} role={role} />}
 
       {tab === "entry" && (

@@ -24,6 +24,13 @@ export default async function SalesPage({ searchParams }) {
   // The sidebar's "Service" entry is this same page deep-linked to the
   // services tab, so the nav highlight has to follow ?tab= too.
   const { tab } = await searchParams;
+
+  // The Sales Tracker is owner-only. SalesScreen does not render the tab
+  // button for staff, but a hidden button is not a guard, so the deep link
+  // is refused here too - the same server-side redirect the other
+  // owner-only screens use. Back to /sales, which opens Sales Entry.
+  if (tab === "tracker" && profile?.role !== "owner") redirect("/sales");
+
   const initialTab = tab === "services" ? "services" : "entry";
 
   return (
