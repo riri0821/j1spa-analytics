@@ -119,6 +119,35 @@ export default function ForecastWorkspace({ products, initialSku = "" }) {
     setResult(outcome.body);
   }
 
+  // Three shapes come back with insufficient_history set, not two, and they
+  // need different screens. The service is not changed to tell them apart -
+  // what it already returns is enough:
+  //
+  //  - No sales at all: it sets `reason` and leaves models empty, with no
+  //    forecast and no depletion figures. There is nothing to show but the
+  //    message.
+  //  - Under 24 months but long enough to fit: `models` holds Simple Moving
+  //    Average alone - candidate_names() offers only that below the gate,
+  //    whatever the model pills say - together with a real forecast,
+  //    depletion estimate and coverage gap. All of it is worth showing; only
+  //    the comparison is missing.
+  //  - Under 24 months and too short even for a moving average (one month of
+  //    history against MA's two-observation minimum): models comes back
+  //    empty. A forecast figure still arrives, but no model produced it, so
+  //    the chart would be labelled "Forecast: null" and the table would have
+  //    no rows. Say so instead.
+  const modelCount = Object.keys(result?.models ?? {}).length;
+  const hasNoHistory = Boolean(result?.reason);
+  // Everything below the notice renders whenever a model actually ran.
+  const showForecastDetail = Boolean(result) && (!result.insufficient_history || modelCount > 0);
+
+  const shortHistoryNotice = hasNoHistory
+    ? result.reason
+    : modelCount > 0
+      ? "Fewer than 24 months of history: forecast with the Simple Moving Average only, without a full model comparison."
+      : "Fewer than 24 months of history, and too short for even a Simple Moving Average, " +
+        "which needs at least two months. No forecast comparison is available for this item yet.";
+
   const chartData = useMemo(() => {
     if (!result) return [];
     const hist = (result.history ?? []).map((h) => ({ label: h.label, historical: h.units, forecast: null }));
@@ -186,7 +215,15 @@ export default function ForecastWorkspace({ products, initialSku = "" }) {
 
       {error && <p className="text-sm text-red-400">{error}</p>}
 
-      {result && !result.insufficient_history && (
+      {/* The notice sits above the figures it qualifies, so a short-history
+          forecast is never read as a full comparison. */}
+      {result && result.insufficient_history && (
+        <p className="text-sm" style={{ color: theme.textMuted }}>
+          {shortHistoryNotice}
+        </p>
+      )}
+
+      {showForecastDetail && (
         <>
           <div className="grid gap-4 lg:grid-cols-[2fr_1fr]">
             <div className="rounded-lg border p-4" style={{ backgroundColor: theme.cardBg, borderColor: theme.border }}>
@@ -218,16 +255,12 @@ export default function ForecastWorkspace({ products, initialSku = "" }) {
           <ModelTable models={result.models} />
 
           <p className="text-xs" style={{ color: theme.textMuted }}>
-            {result.observations_used} underlying historical observations &middot; {result.months_history} months. Primary
-            metric MSE; the lowest-MSE model is selected per item.
+            {result.observations_used} underlying historical observations &middot; {result.months_history} months.{" "}
+            {result.insufficient_history
+              ? "Primary metric MSE; with only one model fitted there is nothing to select between."
+              : "Primary metric MSE; the lowest-MSE model is selected per item."}
           </p>
         </>
-      )}
-
-      {result && result.insufficient_history && (
-        <p className="text-sm" style={{ color: theme.textMuted }}>
-          {result.reason || "Not enough history yet for a full model comparison."}
-        </p>
       )}
     </div>
   );

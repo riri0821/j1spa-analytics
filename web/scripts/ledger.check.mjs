@@ -148,6 +148,47 @@ const none = buildLedger({ product, movements: [], from: null, to: null, names: 
 is("no movements: beginning equals ending equals stock_on_hand",
   [none.beginningBalance, none.endingBalance], [14, 14]);
 
+// ------------------------------------------- the Beginning balance row's date
+//
+// The balance is "as of" the start of the filtered range, so the From date is
+// the only date that describes it. With no From date there is nothing it is
+// as of, and the row must print no date at all.
+//
+// This used to fall back to product.created_at, which on an imported
+// catalogue is the import date - so page 1 opened with a Beginning balance
+// dated LATER than every movement under it. `product` here is created
+// 2026-09-01, after its own 2026-10 movements would be in a real import, and
+// `history` runs from 2026-10-01: a created_at fallback would surface as a
+// date where null is expected, which is what these pin down.
+
+is("no date filter: the beginning balance row has no date",
+  all.beginningDateLabel, null);
+is("no date filter: created_at is not used as the beginning date",
+  all.beginningDateLabel === "Sep 01, 2026", false);
+is("no movements and no filter: still no beginning date",
+  none.beginningDateLabel, null);
+
+const fromOnly = buildLedger({ product, movements: history, from: "2026-10-08", to: null, names: NAMES });
+is("From set: the beginning balance row shows the From date",
+  fromOnly.beginningDateLabel, "Oct 08, 2026");
+is("From set: the beginning balance is still the last balance before it",
+  fromOnly.beginningBalance, 15);
+
+is("From and To set: the beginning date is the From date, not the To",
+  [window.beginningDateLabel, window.asOfLabel], ["Oct 08, 2026", "Oct 09, 2026"]);
+
+const toOnly = buildLedger({ product, movements: history, from: null, to: "2026-10-09", names: NAMES });
+is("To set but no From: still no beginning date", toOnly.beginningDateLabel, null);
+
+// The From date is a Manila day boundary, so a From that is one UTC day
+// earlier must still print the Manila date that was asked for.
+const fromJan1 = buildLedger({ product, movements: history, from: "2026-01-01", to: null, names: NAMES });
+is("From on a day whose UTC start is the day before still prints the Manila date",
+  fromJan1.beginningDateLabel, "Jan 01, 2026");
+
+// An empty period still has a beginning balance, and it is still as of From.
+is("empty window: the beginning date is the From date", empty.beginningDateLabel, "Oct 10, 2026");
+
 // -------------------------------------------------------------------- paging
 
 is("ledger pages hold ten movement rows", LEDGER_PAGE_SIZE, 10);

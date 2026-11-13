@@ -73,7 +73,11 @@ export default async function LedgerPage({ params, searchParams }) {
   const requestedSku = decodeURIComponent(skuParam);
   const { data: product } = await supabase
     .from("products")
-    .select("product_id, sku, name, category, brand, supplier, unit_price, reorder_point, stock_on_hand, created_at")
+    // No created_at: the Beginning balance row used to fall back to it for
+    // its date, which was the bug (an imported catalogue's created_at is the
+    // import date, later than the movements it sat above). Nothing else on
+    // this page reads it.
+    .select("product_id, sku, name, category, brand, supplier, unit_price, reorder_point, stock_on_hand")
     .ilike("sku", escapeLikeTerm(requestedSku))
     .maybeSingle();
 

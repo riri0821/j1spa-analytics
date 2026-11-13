@@ -180,8 +180,17 @@ export function buildLedger({ product, movements, from, to, names }) {
   return {
     openingBalance,
     beginningBalance,
-    // No "From" date means the period starts where the product itself did.
-    beginningDateLabel: formatManilaDate(from ? manilaDayStart(from) : product.created_at),
+    // The beginning balance is "as of" the start of the filtered range, so
+    // the From date is the only date that describes it. With no From date it
+    // is not as of any particular day - it is simply what the item held
+    // before the first row shown - so there is no date to print, and the
+    // row renders with an empty Date cell.
+    //
+    // This used to fall back to product.created_at. On an imported catalogue
+    // that is the import date, not the date the stock history starts, so
+    // page 1 opened with a Beginning balance dated AFTER every movement
+    // beneath it (Sep 30, 2026 above rows from July 2020).
+    beginningDateLabel: from ? formatManilaDate(manilaDayStart(from)) : null,
     rows,
     totalIn,
     totalOut,
