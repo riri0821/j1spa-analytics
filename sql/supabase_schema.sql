@@ -1036,8 +1036,16 @@ begin
       continue;
     end if;
 
-    select product_id, sku, name, stock_on_hand, supplier, unit_cost into v_product
-      from products where product_id = v_pid;
+    -- Aliased and fully qualified: a bare `supplier` here is ambiguous
+    -- between this function's `supplier` PARAMETER and products.supplier,
+    -- which plpgsql rejects outright (SQLSTATE 42702) - it broke every
+    -- Stock In batch from migration 019, which added the parameter, until
+    -- 038 fixed it. v_product.supplier below is unaffected: the record's
+    -- field is still named supplier.
+    select p.product_id, p.sku, p.name, p.stock_on_hand, p.supplier, p.unit_cost
+      into v_product
+      from products p
+      where p.product_id = v_pid;
     if not found then
       raise exception 'Product % not found.', v_pid;
     end if;
